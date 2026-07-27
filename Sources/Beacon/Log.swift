@@ -39,7 +39,7 @@ enum Log {
             fm.createFile(atPath: url.path, contents: nil)
         }
         let handle = try? FileHandle(forWritingTo: url)
-        try? handle?.seekToEnd()
+        _ = try? handle?.seekToEnd()
         return handle
     }()
 

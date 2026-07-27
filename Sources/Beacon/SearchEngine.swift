@@ -596,6 +596,11 @@ final class SearchEngine: ObservableObject {
     private var drillChildren: [SearchResult] = []
     private var drillLoadID = 0
     private let directoryQueue = DispatchQueue(label: "com.beacon.directory", qos: .userInitiated)
+    /// Watches the drilled-in folder so its contents stay live. `reloadCurrentView`
+    /// no-ops safely if the user has since left drill mode.
+    private lazy var drillWatcher = DirectoryWatcher { [weak self] in
+        self?.reloadCurrentView()
+    }
 
     var refinementDimensions: [RefinementDimension] {
         if let cachedRefinementDimensions { return cachedRefinementDimensions }
@@ -1225,6 +1230,10 @@ final class SearchEngine: ObservableObject {
         if !queryText.isEmpty { queryText = "" }
         results = []
 
+        // Keep the drilled view live: a file dropped/saved into this folder
+        // shows up without reopening the panel. Coalesced + off the main thread.
+        drillWatcher.watch(std)
+
         directoryQueue.async { [weak self] in
             let kids = SearchEngine.enumerateDirectory(std)
             DispatchQueue.main.async {
@@ -1246,6 +1255,7 @@ final class SearchEngine: ObservableObject {
     /// Leave drill-in mode and return to normal search/browse.
     func exitDrill() {
         guard drillURL != nil else { return }
+        drillWatcher.stop()
         drillURL = nil
         drillChildren = []
         drillLoadID &+= 1
@@ -3071,13 +3081,6 @@ final class SearchEngine: ObservableObject {
                 ? "voice" : "recording"
         } else if ["mp3", "aac", "flac", "wav", "alac"].contains(ext) {
             facets.contentCategory = facets.artist.isEmpty ? "sound" : "music"
-        }
-
-        if selectedType == .pdfs,
-           refinementSelection.optionID(for: "pdf-text") != nil {
-            let text = item.value(forAttribute: "kMDItemTextContent") as? String ?? ""
-            facets.contentCategory = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                ? "scanned" : "searchable"
         }
 
         return facets

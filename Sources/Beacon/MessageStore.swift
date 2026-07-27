@@ -150,8 +150,7 @@ final class MessageStore {
         }
         var out: [(record: MessageRecord, quality: SearchText.MatchQuality)] = []
         for (index, rec) in cache.enumerated() {   // already sorted newest-first
-            if index & 0x3FF == 0, isCancelled?() == true {
-                Log.write("MessageStore: search cancelled at row \(index) tokens=\(tokens)")
+            if index & 0xFF == 0, isCancelled?() == true {
                 return out.map(\.record)
             }
             // Fast path: match on the precomputed text+handle haystack first;

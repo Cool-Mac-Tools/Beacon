@@ -215,7 +215,7 @@ enum RefinementCatalog {
         case .calendar:
             return [calendarWindow(), calendarName(), temporalDirection()]
         case .pdfs:
-            return [documentLocation(), modifiedDate(), pdfTextLayer()]
+            return [documentLocation(), modifiedDate()]
         case .photos:
             return [photoSource(), photoDate(), format(
                 [.init("png", "PNG"), .init("jpeg", "JPEG"), .init("heic", "HEIC"),
@@ -509,11 +509,6 @@ enum RefinementCatalog {
         ])
     }
 
-    private static func pdfTextLayer() -> RefinementDimension {
-        .init("pdf-text", "Searchable or scanned", options: [
-            .init("searchable", "Searchable text"), .init("scanned", "Scanned image")
-        ])
-    }
 
     private static func photoSource() -> RefinementDimension {
         .init("photo-source", "Source", options: [
@@ -652,8 +647,6 @@ enum RefinementMatcher {
         case "temporal":
             let date = result.modified ?? .distantPast
             return option == "upcoming" ? date >= now : date < now
-        case "pdf-text":
-            return result.facets.contentCategory == option
         case "photo-source":
             return matchesPhotoSource(result, option)
         case "duration":
