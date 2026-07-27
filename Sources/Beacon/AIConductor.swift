@@ -1,14 +1,16 @@
 import Foundation
 
 /// Drives the AI-mode agentic loop: given a natural-language query, it lets the
-/// model call a `search` tool across the user's enabled Beacon sources (as many
-/// rounds as it needs), keeps a pool of every real result it surfaces, and ends
-/// when the model calls `present_results` to pick the best-matching locations.
-/// The output is always locations (result rows) — never prose.
+/// model call `search` across the user's enabled Beacon sources, `read_thread`
+/// to read the conversation around a message hit, and finally `present_results`
+/// to pick the best-matching locations. The output is always locations (result
+/// rows) — never prose.
 ///
-/// Provider-agnostic in spirit; the wire calls here are OpenAI Chat Completions
-/// (matches the BYOK test key). A Claude adapter can slot in behind the same
-/// pool/tool contract.
+/// The loop is provider-agnostic: it keeps a neutral transcript and a neutral
+/// tool spec, and a per-provider adapter (OpenAI Chat Completions, Anthropic
+/// Messages, Google Gemini) serializes that transcript to the wire and parses
+/// the response back into the same neutral shape. BYOK — the active provider's
+/// own key and model are used.
 enum AIConductor {
     private static let maxRounds = 6
     // Smaller than the UI's page size on purpose: the agent should run several
@@ -16,13 +18,37 @@ enum AIConductor {
     // each round's context (and therefore latency) down.
     private static let perSearchCap = 15
 
+    // MARK: - Neutral transcript & tool call
+
+    struct ToolCall {
+        let id: String
+        let name: String
+        let args: [String: Any]
+    }
+
+    private enum Turn {
+        case user(String)
+        case assistant(text: String?, toolCalls: [ToolCall])
+        case toolResults([(call: ToolCall, payload: [String: Any])])
+    }
+
+    struct ToolSpec {
+        let name: String
+        let description: String
+        let parameters: [String: Any]   // JSON Schema object
+    }
+
+    // MARK: - Run
+
     static func run(query: String, engine: SearchEngine) {
         let settings = AISettings.shared
+        let provider = settings.provider
         guard let key = settings.apiKey, !key.isEmpty else {
-            engine.aiSetStatus("Add your API key in AI settings to use AI mode.")
+            engine.aiSetStatus("Add your \(provider.displayName) API key in Manage to use AI mode.")
             engine.aiPublish([])
             return
         }
+        let model = settings.model
         let enabled = AISource.allCases.filter { settings.enabledSources.contains($0) }
         guard !enabled.isEmpty else {
             engine.aiSetStatus("No sources enabled for AI mode.")
@@ -42,35 +68,31 @@ enum AIConductor {
         var pool: [SearchResult] = []           // ref = index into this array
         var poolIDs = Set<String>()
 
-        // Conversation transcript sent to the model each round.
-        var messages: [[String: Any]] = [
-            ["role": "system", "content": systemPrompt(sources: sources)],
-            ["role": "user", "content": query],
-        ]
+        let system = systemPrompt(sources: sources)
         let tools = toolSpecs(sources: sources)
+        var turns: [Turn] = [.user(query)]
 
         for round in 0..<maxRounds {
             engine.aiSetStatus(round == 0 ? "Thinking…" : "Refining…")
-            guard let message = chat(key: key, model: settings.model,
-                                     messages: messages, tools: tools) else {
-                engine.aiSetStatus("Couldn't reach the AI service. Check your key and connection.")
+            guard let response = chat(provider: provider, key: key, model: model,
+                                      system: system, tools: tools, turns: turns) else {
+                engine.aiSetStatus("Couldn't reach \(provider.displayName). Check your key and connection.")
                 engine.aiPublish(pool)   // show anything found so far
                 return
             }
-            messages.append(assistantEcho(message))
+            turns.append(.assistant(text: response.text, toolCalls: response.toolCalls))
 
-            guard let toolCalls = message["tool_calls"] as? [[String: Any]], !toolCalls.isEmpty else {
-                // Model produced no tool call — nothing more to do. Fall back to
-                // whatever it surfaced so the user still gets locations.
+            guard !response.toolCalls.isEmpty else {
+                // No tool call — nothing more to do. Fall back to whatever it
+                // surfaced so the user still gets locations.
                 engine.aiPublish(pool)
                 return
             }
 
-            for call in toolCalls {
-                let callID = call["id"] as? String ?? ""
-                let fn = call["function"] as? [String: Any] ?? [:]
-                let name = fn["name"] as? String ?? ""
-                let args = parseArgs(fn["arguments"])
+            var results: [(call: ToolCall, payload: [String: Any])] = []
+            for call in response.toolCalls {
+                let name = call.name
+                let args = call.args
 
                 if name == "present_results" {
                     let refs = (args["refs"] as? [Any])?.compactMap { intFrom($0) } ?? []
@@ -95,13 +117,9 @@ enum AIConductor {
                             let ref = poolRef(for: row, pool: &pool, ids: &poolIDs)
                             refsForThisCall.append(describe(row, ref: ref))
                         }
-                        messages.append(toolResult(callID: callID, payload: [
-                            "results": refsForThisCall,
-                        ]))
+                        results.append((call, ["results": refsForThisCall]))
                     } else {
-                        messages.append(toolResult(callID: callID, payload: [
-                            "error": "unknown or disabled source",
-                        ]))
+                        results.append((call, ["error": "unknown or disabled source"]))
                     }
                 } else if name == "read_thread" {
                     // Let the model read the conversation around a message it
@@ -119,18 +137,15 @@ enum AIConductor {
                             let r = poolRef(for: row, pool: &pool, ids: &poolIDs)
                             out.append(describe(row, ref: r))
                         }
-                        messages.append(toolResult(callID: callID, payload: [
-                            "thread": out,
-                        ]))
+                        results.append((call, ["thread": out]))
                     } else {
-                        messages.append(toolResult(callID: callID, payload: [
-                            "error": "read_thread needs the ref of a message result",
-                        ]))
+                        results.append((call, ["error": "read_thread needs the ref of a message result"]))
                     }
                 } else {
-                    messages.append(toolResult(callID: callID, payload: ["error": "unknown tool"]))
+                    results.append((call, ["error": "unknown tool"]))
                 }
             }
+            turns.append(.toolResults(results))
         }
 
         // Ran out of rounds without an explicit selection — publish the pool.
@@ -180,13 +195,13 @@ enum AIConductor {
         """
     }
 
-    private static func toolSpecs(sources: [AISource]) -> [[String: Any]] {
+    private static func toolSpecs(sources: [AISource]) -> [ToolSpec] {
         let sourceEnum = sources.map(\.rawValue)
         return [
-            ["type": "function", "function": [
-                "name": "search",
-                "description": "Search one source of the user's Mac by keywords. Returns matching items, each with a numeric ref.",
-                "parameters": [
+            ToolSpec(
+                name: "search",
+                description: "Search one source of the user's Mac by keywords. Returns matching items, each with a numeric ref.",
+                parameters: [
                     "type": "object",
                     "properties": [
                         "source": ["type": "string", "enum": sourceEnum,
@@ -194,37 +209,39 @@ enum AIConductor {
                         "keywords": ["type": "string",
                                      "description": "Space-separated keywords to match."],
                         "limit": ["type": "integer",
-                                  "description": "Max results (default 25)."],
+                                  "description": "Max results (default 15)."],
                     ],
                     "required": ["source", "keywords"],
-                ],
-            ]],
-            ["type": "function", "function": [
-                "name": "read_thread",
-                "description": "Read the messages surrounding a message result (same conversation, in time order). Use this after a Messages search when the item you actually need might be a neighbouring message that doesn't contain the search keywords — e.g. a raw email/password sent right after a message about the topic. Returns messages each with their own ref, plus from/date.",
-                "parameters": [
+                ]
+            ),
+            ToolSpec(
+                name: "read_thread",
+                description: "Read the messages surrounding a message result (same conversation, in time order). Use after a Messages search when the item you need might be a neighbouring message that doesn't contain the search keywords — e.g. a raw email/password sent right after a message about the topic. Returns messages each with their own ref, plus from/date.",
+                parameters: [
                     "type": "object",
                     "properties": [
                         "ref": ["type": "integer",
                                 "description": "The ref of a message result to read around."],
                     ],
                     "required": ["ref"],
-                ],
-            ]],
-            ["type": "function", "function": [
-                "name": "present_results",
-                "description": "Finish by presenting the chosen locations to the user, most relevant first.",
-                "parameters": [
+                ]
+            ),
+            ToolSpec(
+                name: "present_results",
+                description: "Finish by presenting the chosen locations to the user, most relevant first.",
+                parameters: [
                     "type": "object",
                     "properties": [
                         "refs": ["type": "array", "items": ["type": "integer"],
                                  "description": "The refs of the items to show, best first."],
                     ],
                     "required": ["refs"],
-                ],
-            ]],
+                ]
+            ),
         ]
     }
+
+    // MARK: - Result description
 
     /// Insert a result into the shared pool (deduped by id) and return its ref.
     private static func poolRef(for row: SearchResult,
@@ -286,56 +303,230 @@ enum AIConductor {
         return String(flat.prefix(160))
     }
 
-    // MARK: - OpenAI Chat Completions (synchronous; called on aiQueue)
+    // MARK: - Provider dispatch
 
-    /// Returns the assistant `message` object, or nil on failure.
-    private static func chat(key: String, model: String,
-                             messages: [[String: Any]], tools: [[String: Any]]) -> [String: Any]? {
-        guard let url = URL(string: "https://api.openai.com/v1/chat/completions") else { return nil }
-        let body: [String: Any] = [
-            "model": model,
-            "messages": messages,
-            "tools": tools,
-            "tool_choice": "auto",
-        ]
-        guard let data = try? JSONSerialization.data(withJSONObject: body) else { return nil }
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
-        request.httpBody = data
-        request.timeoutInterval = 60
+    private struct Reply {
+        let text: String?
+        let toolCalls: [ToolCall]
+    }
 
+    /// Serialize the neutral transcript for `provider`, POST it, and parse the
+    /// reply back into the neutral shape. Synchronous; called on aiQueue.
+    private static func chat(provider: AISettings.Provider, key: String, model: String,
+                             system: String, tools: [ToolSpec], turns: [Turn]) -> Reply? {
+        let request: URLRequest?
+        switch provider {
+        case .openai:    request = openAIRequest(key: key, model: model, system: system, tools: tools, turns: turns)
+        case .anthropic: request = anthropicRequest(key: key, model: model, system: system, tools: tools, turns: turns)
+        case .google:    request = geminiRequest(key: key, model: model, system: system, tools: tools, turns: turns)
+        }
+        guard let request, let json = send(request) else { return nil }
+        if let err = json["error"] as? [String: Any] {
+            Log.write("AI \(provider.rawValue) error: \(err["message"] ?? "unknown")")
+            return nil
+        }
+        switch provider {
+        case .openai:    return openAIParse(json)
+        case .anthropic: return anthropicParse(json)
+        case .google:    return geminiParse(json)
+        }
+    }
+
+    /// Fire the request synchronously (we're already off the main thread on
+    /// aiQueue) and decode the JSON body.
+    private static func send(_ request: URLRequest) -> [String: Any]? {
         let sem = DispatchSemaphore(value: 0)
         var out: Data?
         URLSession.shared.dataTask(with: request) { d, _, _ in out = d; sem.signal() }.resume()
         _ = sem.wait(timeout: .now() + 65)
-
         guard let out,
               let json = try? JSONSerialization.jsonObject(with: out) as? [String: Any] else { return nil }
-        if let err = json["error"] as? [String: Any] {
-            Log.write("AI chat error: \(err["message"] ?? "unknown")")
-            return nil
+        return json
+    }
+
+    private static func post(_ url: URL, headers: [String: String], body: [String: Any]) -> URLRequest? {
+        guard let data = try? JSONSerialization.data(withJSONObject: body) else { return nil }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        for (k, v) in headers { request.setValue(v, forHTTPHeaderField: k) }
+        request.httpBody = data
+        request.timeoutInterval = 60
+        return request
+    }
+
+    // MARK: - OpenAI (Chat Completions)
+
+    private static func openAIRequest(key: String, model: String, system: String,
+                                      tools: [ToolSpec], turns: [Turn]) -> URLRequest? {
+        var messages: [[String: Any]] = [["role": "system", "content": system]]
+        for turn in turns {
+            switch turn {
+            case .user(let text):
+                messages.append(["role": "user", "content": text])
+            case .assistant(let text, let calls):
+                var msg: [String: Any] = ["role": "assistant"]
+                msg["content"] = text ?? NSNull()
+                if !calls.isEmpty {
+                    msg["tool_calls"] = calls.map { c -> [String: Any] in
+                        ["id": c.id, "type": "function",
+                         "function": ["name": c.name, "arguments": jsonString(c.args)]]
+                    }
+                }
+                messages.append(msg)
+            case .toolResults(let results):
+                for r in results {
+                    messages.append(["role": "tool", "tool_call_id": r.call.id,
+                                     "content": jsonString(r.payload)])
+                }
+            }
         }
-        let choices = json["choices"] as? [[String: Any]]
-        return choices?.first?["message"] as? [String: Any]
+        let toolSpecs = tools.map { t -> [String: Any] in
+            ["type": "function",
+             "function": ["name": t.name, "description": t.description, "parameters": t.parameters]]
+        }
+        let body: [String: Any] = [
+            "model": model, "messages": messages,
+            "tools": toolSpecs, "tool_choice": "auto",
+        ]
+        guard let url = URL(string: "https://api.openai.com/v1/chat/completions") else { return nil }
+        return post(url, headers: ["Authorization": "Bearer \(key)"], body: body)
     }
 
-    // MARK: - Message helpers
-
-    /// Echo the assistant message back into the transcript. Only the fields the
-    /// API needs to continue the tool loop are preserved.
-    private static func assistantEcho(_ message: [String: Any]) -> [String: Any] {
-        var echo: [String: Any] = ["role": "assistant"]
-        echo["content"] = message["content"] ?? NSNull()
-        if let toolCalls = message["tool_calls"] { echo["tool_calls"] = toolCalls }
-        return echo
+    private static func openAIParse(_ json: [String: Any]) -> Reply? {
+        guard let choices = json["choices"] as? [[String: Any]],
+              let message = choices.first?["message"] as? [String: Any] else { return nil }
+        let text = message["content"] as? String
+        var calls: [ToolCall] = []
+        if let toolCalls = message["tool_calls"] as? [[String: Any]] {
+            for call in toolCalls {
+                let id = call["id"] as? String ?? ""
+                let fn = call["function"] as? [String: Any] ?? [:]
+                let name = fn["name"] as? String ?? ""
+                calls.append(ToolCall(id: id, name: name, args: parseArgs(fn["arguments"])))
+            }
+        }
+        return Reply(text: text, toolCalls: calls)
     }
 
-    private static func toolResult(callID: String, payload: [String: Any]) -> [String: Any] {
-        let content = (try? JSONSerialization.data(withJSONObject: payload))
+    // MARK: - Anthropic (Messages)
+
+    private static func anthropicRequest(key: String, model: String, system: String,
+                                         tools: [ToolSpec], turns: [Turn]) -> URLRequest? {
+        var messages: [[String: Any]] = []
+        for turn in turns {
+            switch turn {
+            case .user(let text):
+                messages.append(["role": "user", "content": text])
+            case .assistant(let text, let calls):
+                var content: [[String: Any]] = []
+                if let text, !text.isEmpty { content.append(["type": "text", "text": text]) }
+                for c in calls {
+                    content.append(["type": "tool_use", "id": c.id, "name": c.name, "input": c.args])
+                }
+                messages.append(["role": "assistant", "content": content])
+            case .toolResults(let results):
+                let content = results.map { r -> [String: Any] in
+                    ["type": "tool_result", "tool_use_id": r.call.id, "content": jsonString(r.payload)]
+                }
+                messages.append(["role": "user", "content": content])
+            }
+        }
+        let toolSpecs = tools.map { t -> [String: Any] in
+            ["name": t.name, "description": t.description, "input_schema": t.parameters]
+        }
+        let body: [String: Any] = [
+            "model": model, "max_tokens": 2048, "system": system,
+            "messages": messages, "tools": toolSpecs, "tool_choice": ["type": "auto"],
+        ]
+        guard let url = URL(string: "https://api.anthropic.com/v1/messages") else { return nil }
+        return post(url, headers: [
+            "x-api-key": key,
+            "anthropic-version": "2023-06-01",
+        ], body: body)
+    }
+
+    private static func anthropicParse(_ json: [String: Any]) -> Reply? {
+        guard let content = json["content"] as? [[String: Any]] else { return nil }
+        var text = ""
+        var calls: [ToolCall] = []
+        for block in content {
+            switch block["type"] as? String {
+            case "text":
+                text += block["text"] as? String ?? ""
+            case "tool_use":
+                let id = block["id"] as? String ?? ""
+                let name = block["name"] as? String ?? ""
+                let input = block["input"] as? [String: Any] ?? [:]
+                calls.append(ToolCall(id: id, name: name, args: input))
+            default:
+                break
+            }
+        }
+        return Reply(text: text.isEmpty ? nil : text, toolCalls: calls)
+    }
+
+    // MARK: - Google (Gemini generateContent)
+
+    private static func geminiRequest(key: String, model: String, system: String,
+                                      tools: [ToolSpec], turns: [Turn]) -> URLRequest? {
+        var contents: [[String: Any]] = []
+        for turn in turns {
+            switch turn {
+            case .user(let text):
+                contents.append(["role": "user", "parts": [["text": text]]])
+            case .assistant(let text, let calls):
+                var parts: [[String: Any]] = []
+                if let text, !text.isEmpty { parts.append(["text": text]) }
+                for c in calls {
+                    parts.append(["functionCall": ["name": c.name, "args": c.args]])
+                }
+                contents.append(["role": "model", "parts": parts])
+            case .toolResults(let results):
+                let parts = results.map { r -> [String: Any] in
+                    ["functionResponse": ["name": r.call.name, "response": r.payload]]
+                }
+                contents.append(["role": "user", "parts": parts])
+            }
+        }
+        let declarations = tools.map { t -> [String: Any] in
+            ["name": t.name, "description": t.description, "parameters": t.parameters]
+        }
+        let body: [String: Any] = [
+            "system_instruction": ["parts": [["text": system]]],
+            "contents": contents,
+            "tools": [["function_declarations": declarations]],
+            "tool_config": ["function_calling_config": ["mode": "AUTO"]],
+        ]
+        let endpoint = "https://generativelanguage.googleapis.com/v1beta/models/\(model):generateContent"
+        guard let url = URL(string: endpoint) else { return nil }
+        return post(url, headers: ["x-goog-api-key": key], body: body)
+    }
+
+    private static func geminiParse(_ json: [String: Any]) -> Reply? {
+        guard let candidates = json["candidates"] as? [[String: Any]],
+              let content = candidates.first?["content"] as? [String: Any],
+              let parts = content["parts"] as? [[String: Any]] else { return nil }
+        var text = ""
+        var calls: [ToolCall] = []
+        for (i, part) in parts.enumerated() {
+            if let t = part["text"] as? String {
+                text += t
+            } else if let fc = part["functionCall"] as? [String: Any] {
+                let name = fc["name"] as? String ?? ""
+                let args = fc["args"] as? [String: Any] ?? [:]
+                // Gemini function calls carry no id; synthesize a stable one.
+                calls.append(ToolCall(id: "call_\(i)", name: name, args: args))
+            }
+        }
+        return Reply(text: text.isEmpty ? nil : text, toolCalls: calls)
+    }
+
+    // MARK: - JSON helpers
+
+    private static func jsonString(_ obj: [String: Any]) -> String {
+        (try? JSONSerialization.data(withJSONObject: obj))
             .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
-        return ["role": "tool", "tool_call_id": callID, "content": content]
     }
 
     private static func parseArgs(_ raw: Any?) -> [String: Any] {

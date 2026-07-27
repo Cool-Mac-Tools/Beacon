@@ -1943,23 +1943,32 @@ struct SearchView: View {
                     .buttonStyle(.plain).foregroundStyle(.secondary)
                 }
 
-                // API key
+                // Provider tabs — the selected one is the active provider used
+                // for queries. Each keeps its own key + model.
+                providerTabs
+
+                let provider = aiSettings.provider
+
+                // API key (per provider)
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
-                        Text("\(aiSettings.provider.displayName) API key")
+                        Text("\(provider.displayName) API key")
                             .font(.system(size: 12, weight: .semibold))
                         Spacer()
-                        if aiSettings.hasKey {
+                        if aiSettings.hasKey(for: provider) {
                             Label("Key saved", systemImage: "checkmark.circle.fill")
                                 .font(.system(size: 11, weight: .medium))
                                 .foregroundStyle(.green)
                         } else {
-                            Text("No key yet")
-                                .font(.system(size: 11)).foregroundStyle(.secondary)
+                            Link(destination: provider.keyURL) {
+                                Label("Get a key", systemImage: "arrow.up.right.square")
+                                    .font(.system(size: 11, weight: .medium))
+                            }
                         }
                     }
                     HStack(spacing: 8) {
-                        SecureField(aiSettings.hasKey ? "•••••••• (saved) — paste to replace" : "sk-…",
+                        SecureField(aiSettings.hasKey(for: provider)
+                                    ? "•••••••• (saved) — paste to replace" : provider.keyPlaceholder,
                                     text: $aiKeyDraft)
                             .textFieldStyle(.roundedBorder)
                             .focused($aiKeyFieldFocused)
@@ -1967,35 +1976,46 @@ struct SearchView: View {
                         Button("Save") { saveAIKey() }
                             .buttonStyle(.borderedProminent)
                             .disabled(aiKeyDraft.trimmingCharacters(in: .whitespaces).isEmpty)
-                        if aiSettings.hasKey {
-                            Button("Remove") { aiSettings.apiKey = nil; aiKeyDraft = "" }
+                        if aiSettings.hasKey(for: provider) {
+                            Button("Remove") {
+                                aiSettings.setKey(nil, for: provider)
+                                aiKeyDraft = ""
+                            }
                         }
                     }
+                    Text("Your key stays on this Mac and is sent only to \(provider.displayName). You're billed by \(provider.displayName) for your own usage.")
+                        .font(.system(size: 10)).foregroundStyle(.tertiary)
                 }
 
-                // Model picker
+                // Model picker (per provider). Scrolls when a provider offers a
+                // long lineup so the panel stays compact.
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Model").font(.system(size: 12, weight: .semibold))
-                    ForEach(aiSettings.provider.models, id: \.self) { m in
-                        Button { aiSettings.model = m } label: {
-                            HStack(spacing: 10) {
-                                Image(systemName: aiSettings.model == m
-                                      ? "largecircle.fill.circle" : "circle")
-                                    .foregroundStyle(aiSettings.model == m ? Color.accentColor : .secondary)
-                                VStack(alignment: .leading, spacing: 1) {
-                                    Text(m).font(.system(size: 13, weight: .medium))
-                                    Text(aiSettings.provider.blurb(for: m))
-                                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 2) {
+                            ForEach(provider.models, id: \.self) { m in
+                                let selected = aiSettings.model(for: provider) == m
+                                Button { aiSettings.setModel(m, for: provider) } label: {
+                                    HStack(spacing: 10) {
+                                        Image(systemName: selected ? "largecircle.fill.circle" : "circle")
+                                            .foregroundStyle(selected ? Color.accentColor : .secondary)
+                                        VStack(alignment: .leading, spacing: 1) {
+                                            Text(m).font(.system(size: 13, weight: .medium))
+                                            Text(provider.blurb(for: m))
+                                                .font(.system(size: 11)).foregroundStyle(.secondary)
+                                        }
+                                        Spacer()
+                                    }
+                                    .padding(.horizontal, 10).padding(.vertical, 7)
+                                    .background(RoundedRectangle(cornerRadius: 9)
+                                        .fill(selected ? Color.accentColor.opacity(0.10) : .clear))
+                                    .contentShape(Rectangle())
                                 }
-                                Spacer()
+                                .buttonStyle(.plain)
                             }
-                            .padding(.horizontal, 10).padding(.vertical, 7)
-                            .background(RoundedRectangle(cornerRadius: 9)
-                                .fill(aiSettings.model == m ? Color.accentColor.opacity(0.10) : .clear))
-                            .contentShape(Rectangle())
                         }
-                        .buttonStyle(.plain)
                     }
+                    .frame(maxHeight: 172)
                 }
 
                 // Sources
@@ -2033,10 +2053,43 @@ struct SearchView: View {
         .onAppear { aiKeyFieldFocused = true }
     }
 
+    /// Segmented row of provider tabs. Selecting one makes it the active
+    /// provider and clears the draft field so a half-typed key can't leak across
+    /// providers. Each tab shows a check when that provider already has a key.
+    private var providerTabs: some View {
+        HStack(spacing: 4) {
+            ForEach(AISettings.Provider.allCases) { p in
+                let active = aiSettings.provider == p
+                Button {
+                    if aiSettings.provider != p {
+                        aiSettings.provider = p
+                        aiKeyDraft = ""
+                    }
+                } label: {
+                    HStack(spacing: 5) {
+                        if aiSettings.hasKey(for: p) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .font(.system(size: 10))
+                                .foregroundStyle(active ? Color.white.opacity(0.9) : .green)
+                        }
+                        Text(p.shortName).font(.system(size: 12, weight: .medium))
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 6)
+                    .background(RoundedRectangle(cornerRadius: 8)
+                        .fill(active ? Color.accentColor : Color.primary.opacity(0.06)))
+                    .foregroundStyle(active ? Color.white : Color.primary)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
     private func saveAIKey() {
         let k = aiKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !k.isEmpty else { return }
-        aiSettings.apiKey = k
+        aiSettings.setKey(k, for: aiSettings.provider)
         aiKeyDraft = ""
         aiKeyFieldFocused = false
     }
