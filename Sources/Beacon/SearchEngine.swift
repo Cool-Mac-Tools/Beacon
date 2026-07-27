@@ -589,6 +589,39 @@ final class SearchEngine: ObservableObject {
         rawValue: UserDefaults.standard.string(forKey: "beacon.resultSortMode") ?? ""
     ) ?? .recent
 
+    /// AI mode: an opt-in agentic layer that searches across sources and returns
+    /// locations (result rows), driven by the user's own API key. `aiStatus` is
+    /// a live progress line ("Searching Messages…"); `aiRunning` gates the UI.
+    @Published var aiMode: Bool = false {
+        didSet {
+            guard aiMode != oldValue else { return }
+            aiRunning = false
+            aiStatus = ""
+            if aiMode {
+                // Entering AI mode: stop any in-flight normal search so its async
+                // callbacks can't republish files into the list.
+                pendingSearch?.cancel()
+                pendingIndexPublish?.cancel()
+                nameQuery.stop()
+                contentQuery.stop()
+                contentQueryActive = false
+                searchToken &+= 1
+                results = []
+                isSearching = false
+                needsFullDiskAccess = false
+            } else {
+                // Leaving AI mode restores the normal live search for the query.
+                results = []
+                scheduleSearch()
+            }
+        }
+    }
+    @Published private(set) var aiStatus: String = ""
+    @Published private(set) var aiRunning: Bool = false
+    /// Serial queue for the AI agent loop so tool searches don't race the
+    /// normal (mode-off) search path, which shares the same store instances.
+    private let aiQueue = DispatchQueue(label: "com.beacon.ai", qos: .userInitiated)
+
     /// When non-nil, Beacon is browsing the immediate contents of this folder
     /// (Finder-style drill-in) instead of running a Spotlight search. Typing
     /// filters the folder's children in memory; navigation is instant.
@@ -965,6 +998,7 @@ final class SearchEngine: ObservableObject {
     // MARK: - Search lifecycle
 
     private func publishPage(_ rows: [SearchResult], preserveCandidates: Bool = false) {
+        if aiMode { return }   // AI mode owns `results` via aiPublish only
         let scoped = rows.filter { matchesTopLevelType($0, type: selectedType) }
         if !preserveCandidates {
             refinementCandidates = scoped
@@ -1067,6 +1101,14 @@ final class SearchEngine: ObservableObject {
     }
 
     private func scheduleSearch() {
+        // AI mode doesn't search per keystroke — it runs on submit (Send/Enter)
+        // via runAIQuery. Suppress the normal live search, and clear any stale
+        // normal results so the panel never looks like a normal search.
+        if aiMode {
+            isSearching = false
+            if !aiRunning { results = [] }
+            return
+        }
         pendingSearch?.cancel()
         pendingIndexPublish?.cancel()
         pageLimit = pageSize
@@ -1278,6 +1320,122 @@ final class SearchEngine: ObservableObject {
             }
         } else {
             refreshForPanelShow()
+        }
+    }
+
+    // MARK: - AI mode
+
+    /// Run one source's search synchronously and map to SearchResult rows. Called
+    /// off the main thread by the AI conductor (on `aiQueue`). This is the bridge
+    /// the AI layer uses to reach Beacon's otherwise-private stores.
+    func aiToolSearch(_ source: AISource, tokens: [String], limit: Int) -> [SearchResult] {
+        guard !tokens.isEmpty else { return [] }
+        switch source {
+        case .messages:
+            // MessageStore isn't internally synchronized — it's meant to be
+            // touched only from messageQueue. This runs on aiQueue, and the
+            // launch-time warm-up loads on messageQueue, so serialize here to
+            // avoid racing that load. Also: the store is lazy, so ensureLoaded()
+            // is required or the first AI message search hits `guard state ==
+            // .ready` and silently returns nothing (the agent then reports it
+            // couldn't find any messages).
+            return messageQueue.sync {
+                messageStore.ensureLoaded()
+                contacts.ensureLoaded()
+                guard !messageStore.needsFullDiskAccess else { return [] }
+                let resolver: ((String) -> String?)? = contacts.isReady ? { self.contacts.name(for: $0) } : nil
+                return messageStore.search(tokens: tokens, limit: limit, nameResolver: resolver)
+                    .map { SearchResult(message: $0, contactName: self.contacts.name(for: $0.conversationHandle)) }
+            }
+        case .mail:
+            return mailStore.search(tokens: tokens, limit: limit).map { SearchResult(mail: $0) }
+        case .notes:
+            return notesStore.search(tokens: tokens, limit: limit).map { SearchResult(note: $0) }
+        case .calendar:
+            return calendarStore.search(tokens: tokens, limit: limit).map { SearchResult(calendar: $0) }
+        case .history:
+            return historyStore.search(tokens: tokens, limit: limit).map { SearchResult(history: $0) }
+        case .clipboard:
+            return ClipboardStore.shared.search(tokens: tokens, limit: limit).map { SearchResult(clip: $0) }
+        case .apps:
+            return (appStore.search(tokens: tokens, limit: limit) ?? []).map { SearchResult(app: $0) }
+        case .folders:
+            return folderStore.search(tokens: tokens, limit: limit).map { SearchResult(folder: $0) }
+        case .files:
+            // v1: recent files (synchronous). Full Spotlight file search is a
+            // follow-up (NSMetadataQuery is async / MDQuery is the sync upgrade).
+            return recentsStore.search(tokens: tokens, limit: limit).map { SearchResult(recent: $0) }
+        }
+    }
+
+    /// The conversation surrounding one message result, oldest→newest. Lets the
+    /// AI *read a thread* the way the user would after tapping a hit — crucial
+    /// because the message that actually answers a query (e.g. a raw email +
+    /// password) often contains none of the search keywords and is only findable
+    /// as the neighbour of a message that does. Runs on messageQueue for the
+    /// same thread-safety reasons as `aiToolSearch`.
+    func aiThreadContext(around rowid: Int64, radius: Int = 12) -> [SearchResult] {
+        return messageQueue.sync {
+            messageStore.ensureLoaded()
+            contacts.ensureLoaded()
+            guard !messageStore.needsFullDiskAccess else { return [] }
+            return messageStore.context(around: rowid, radius: radius)
+                .map { SearchResult(message: $0, contactName: self.contacts.name(for: $0.conversationHandle)) }
+        }
+    }
+
+    func aiSetStatus(_ text: String) {
+        DispatchQueue.main.async { self.aiStatus = text }
+    }
+
+    /// Return the enabled sources the AI can actually search right now, dropping
+    /// any FDA-gated source (Messages/Mail/Notes) whose access hasn't been
+    /// granted. A single locked source no longer walls the whole query — the AI
+    /// searches the rest. Only when *every* enabled source is blocked do we
+    /// surface the Full Disk Access prompt. Runs on aiQueue.
+    func aiUsableSources(_ sources: [AISource]) -> [AISource] {
+        var blocked: Set<AISource> = []
+        if sources.contains(.messages) { _ = messageStore.probeAccess(); if messageStore.needsFullDiskAccess { blocked.insert(.messages) } }
+        if sources.contains(.mail) { mailStore.ensureLoaded(); if mailStore.needsFullDiskAccess { blocked.insert(.mail) } }
+        if sources.contains(.notes) { notesStore.ensureLoaded(); if notesStore.needsFullDiskAccess { blocked.insert(.notes) } }
+        let usable = sources.filter { !blocked.contains($0) }
+        let allBlocked = usable.isEmpty && !blocked.isEmpty
+        DispatchQueue.main.async {
+            self.needsFullDiskAccess = allBlocked
+            if allBlocked, let url = URL(string:
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
+                NSWorkspace.shared.open(url)
+            }
+        }
+        return usable
+    }
+
+    /// Publish the AI-chosen locations, preserving the agent's ranking order
+    /// (no relevance re-sort, unlike normal search).
+    func aiPublish(_ rows: [SearchResult]) {
+        DispatchQueue.main.async {
+            var seen = Set<String>()
+            let deduped = rows.filter { seen.insert($0.id).inserted }
+            self.aiRunning = false
+            self.isSearching = false
+            self.canLoadMore = false
+            self.isShowingStaleResults = false
+            self.results = deduped
+        }
+    }
+
+    /// Entry point for an AI-mode query. Delegates to the conductor, which drives
+    /// the provider's agentic loop and calls back into aiToolSearch / aiPublish.
+    func runAIQuery(_ query: String) {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        aiRunning = true
+        aiStatus = "Thinking…"
+        isSearching = true
+        results = []
+        aiQueue.async { [weak self] in
+            guard let self else { return }
+            AIConductor.run(query: trimmed, engine: self)
         }
     }
 
@@ -2157,6 +2315,7 @@ final class SearchEngine: ObservableObject {
     /// mode the sources are grouped (files, then messages, then notes); other
     /// file-backed modes show just their files.
     private func publish() {
+        if aiMode { return }   // AI mode owns `results` via aiPublish only
         if selectedType == .all {
             let rawFileRows = mergeScannedApps(into: fileResults)
             refinementCandidates = rawFileRows + messageResults + noteResults
@@ -2567,6 +2726,15 @@ final class SearchEngine: ObservableObject {
             _ = self.messageStore.probeAccess()
             let needsAccess = self.messageStore.needsFullDiskAccess
             DispatchQueue.main.async { self.needsFullDiskAccess = needsAccess }
+            // Beacon stays resident, so pay the one-time load cost now, in the
+            // background, instead of on the user's first search. When access is
+            // granted this fully populates the cache; the first Messages query
+            // (normal or AI) then returns instantly instead of spinning while
+            // it scans the whole history.
+            if !needsAccess {
+                self.messageStore.ensureLoaded()
+                self.contacts.ensureLoaded()
+            }
         }
     }
 
@@ -2593,6 +2761,10 @@ final class SearchEngine: ObservableObject {
     /// new clipboard entries) and self-heals any view that wedged on a stale
     /// publish - without waiting for the user to retype.
     func refreshForPanelShow() {
+        // In AI mode, reopening the panel must NOT disturb an in-flight run or a
+        // finished answer — the agent keeps working in the background while the
+        // panel is hidden, and the results should still be here on return.
+        if aiMode { return }
         recentsStore.refresh()
         folderQueue.async { [folderStore] in
             folderStore.refreshIfStale()
@@ -2834,6 +3006,7 @@ final class SearchEngine: ObservableObject {
     }
 
     private func publishIndexResults() {
+        if aiMode { return }   // AI mode owns `results`; ignore late index ticks
         // Ignore late file-index notifications while a database-backed filter
         // (Messages/Notes/Clipboard/History) is active, so they can't overwrite
         // that filter's results.

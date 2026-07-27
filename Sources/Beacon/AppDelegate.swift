@@ -28,6 +28,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Launched from the DMG or Downloads? Install into /Applications and
         // relaunch from there - the user never has to drag anything.
         if SelfInstaller.installIfNeeded() { return }
+        installEditMenu()
         setupStatusItem()
         setupPanel()
         setupHotKey()
@@ -48,6 +49,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Begin recording clipboard history (text only, private/transient
         // copies excluded) so it's searchable under the Clipboard filter.
         ClipboardStore.shared.start()
+        AISettings.shared.loadEnabledSources()
         Log.write("Ready. Menu-bar icon active; panel shown.")
     }
 
@@ -83,6 +85,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                     keyEquivalent: "")
         launchItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
         menu.addItem(launchItem)
+        menu.addItem(withTitle: "AI Settings…",
+                     action: #selector(showAISettings),
+                     keyEquivalent: "")
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "Quit Beacon",
                               action: #selector(NSApplication.terminate(_:)),
@@ -147,6 +152,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             outcome.runModal()
         }
+    }
+
+    /// Menu → AI Settings: show the panel and let the in-panel settings screen
+    /// handle key/model/sources (a real UI, not a modal alert).
+    @objc private func showAISettings() {
+        showPanel()
+        NotificationCenter.default.post(name: Notification.Name("BeaconOpenAISettings"), object: nil)
+    }
+
+    /// Beacon is a menu-bar agent with no standard menu, so text fields don't
+    /// get Cut/Copy/Paste/Select-All key equivalents (⌘V does nothing). Install
+    /// a minimal Edit menu wired through the responder chain to enable them.
+    private func installEditMenu() {
+        let mainMenu = NSMenu()
+        let editItem = NSMenuItem()
+        let editMenu = NSMenu(title: "Edit")
+        editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(.separator())
+        editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editItem.submenu = editMenu
+        mainMenu.addItem(editItem)
+        NSApp.mainMenu = mainMenu
     }
 
     private func setupStatusItem() {

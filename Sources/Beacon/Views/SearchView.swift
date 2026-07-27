@@ -6,6 +6,7 @@ struct SearchView: View {
     @ObservedObject private var filterLayout = FilterLayoutStore.shared
     @ObservedObject private var refinementLayout = RefinementLayoutStore.shared
     @ObservedObject private var license = LicenseStore.shared
+    @ObservedObject private var aiSettings = AISettings.shared
     let onClose: () -> Void
     let onEditingChanged: (Bool) -> Void
     let onRefinementSidebarChanged: (Bool) -> Void
@@ -32,6 +33,33 @@ struct SearchView: View {
     @FocusState private var renameFieldFocused: Bool
     /// The folder row currently highlighted as a drop target.
     @State private var dropTargetID: String?
+    /// AI mode: the last question submitted, and the first-run privacy gate.
+    @State private var lastAISubmitted: String?
+    @State private var showAIDisclosure = false
+    @State private var showAISettingsPanel = false
+    @State private var aiKeyDraft = ""
+    @FocusState private var aiKeyFieldFocused: Bool
+    /// Rotating "flavor" line shown under the concrete status while the AI runs,
+    /// to keep the wait engaging.
+    @State private var aiPhraseIndex = 0
+    private let aiPhraseTimer = Timer.publish(every: 1.8, on: .main, in: .common).autoconnect()
+    /// Loading lines that reference the user's own question (built locally — no
+    /// extra model call, so zero speed cost).
+    private var aiLoadingPhrases: [String] {
+        let q = (lastAISubmitted ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else {
+            return ["Reading your request…", "Searching your Mac…",
+                    "Weighing the best matches…", "Almost there…"]
+        }
+        let short = q.count > 44 ? String(q.prefix(42)) + "…" : q
+        return [
+            "Understanding what you need…",
+            "Looking for “\(short)”…",
+            "Searching where it might live…",
+            "Weighing the best matches…",
+            "Almost there…",
+        ]
+    }
     /// "New Folder…" (from the move picker): destination + files to move in.
     @State private var newFolderParent: URL?
     @State private var newFolderSources: [URL] = []
@@ -126,6 +154,16 @@ struct SearchView: View {
         .overlay {
             if !license.statusSnapshot.grantsAccess { licenseLockOverlay }
         }
+        .overlay {
+            if showAIDisclosure { aiDisclosureOverlay }
+        }
+        .overlay {
+            if showAISettingsPanel { aiSettingsPanel }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: Notification.Name("BeaconOpenAISettings"))) { _ in
+            aiKeyDraft = ""
+            showAISettingsPanel = true
+        }
         .onAppear { license.refresh() }
         .onChange(of: engine.selectedType) { _ in
             ThumbnailStore.shared.cancelAll()
@@ -172,7 +210,9 @@ struct SearchView: View {
     private var contentBelowSearch: some View {
         VStack(spacing: 0) {
             if activePreview == nil {
-                if engine.drillURL != nil {
+                if engine.aiMode {
+                    aiBanner
+                } else if engine.drillURL != nil {
                     breadcrumbBar
                 } else {
                     filterChips
@@ -683,7 +723,7 @@ struct SearchView: View {
                     onMoveUp: { moveSelection(-verticalSelectionStep) },
                     onMoveRight: { drillIntoSelectedFolder() },
                     onMoveLeft: { if engine.drillURL != nil { drillUp() } },
-                    onSubmit: { openSelected() },
+                    onSubmit: { handleSubmit() },
                     onReveal: { revealSelected() },
                     onPreview: { previewSelected() },
                     onCopy: { copySelectedItem() },
@@ -700,11 +740,30 @@ struct SearchView: View {
                 )
                 .frame(height: 34)
 
-                if engine.isSearching || isLoadingPreview {
+                // In AI mode the loading lives in the middle + footer, not here.
+                if (engine.isSearching || isLoadingPreview) && !engine.aiMode {
                     ProgressView()
                         .controlSize(.small)
                         .tint(.secondary)
                         .transition(.opacity)
+                }
+
+                if !filterLayout.isEditing {
+                    Button { toggleAIMode() } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "sparkles")
+                            Text("AI")
+                        }
+                        .font(.system(size: 11, weight: .semibold))
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 5)
+                        .background(Capsule().fill(engine.aiMode
+                            ? Color.accentColor
+                            : Color.primary.opacity(0.08)))
+                        .foregroundStyle(engine.aiMode ? Color.white : Color.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("AI mode — ask in plain language, get locations")
                 }
 
                 if filterLayout.isEditing {
@@ -1220,7 +1279,9 @@ struct SearchView: View {
 
     private var resultsArea: some View {
         Group {
-            if let requirement = engine.selectedType.externalSourceRequirement,
+            if engine.aiMode {
+                aiResultsArea
+            } else if let requirement = engine.selectedType.externalSourceRequirement,
                requirement.state != .ready {
                 externalSourcePrompt(requirement)
             } else if engine.selectedType == .iCloudDrive && !iCloudDriveReady {
@@ -1265,6 +1326,58 @@ struct SearchView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// AI-mode content area: the agent's chosen locations, a thinking state
+    /// while it runs, or an invite to ask — never the normal "No results" state.
+    @ViewBuilder
+    private var aiResultsArea: some View {
+        if engine.needsFullDiskAccess {
+            fullDiskAccessPrompt
+        } else if !engine.results.isEmpty {
+            resultsList
+        } else if engine.aiRunning {
+            VStack(spacing: 14) {
+                ProgressView().controlSize(.large)
+                Text(aiLoadingPhrases[aiPhraseIndex % aiLoadingPhrases.count])
+                    .font(.system(size: 16, weight: .semibold))
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 460)
+                    .id(aiPhraseIndex)
+                    .transition(.opacity)
+                if !engine.aiStatus.isEmpty {
+                    Text(engine.aiStatus)
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .onReceive(aiPhraseTimer) { _ in
+                if engine.aiRunning { withAnimation(.easeInOut(duration: 0.35)) { aiPhraseIndex += 1 } }
+            }
+        } else {
+            VStack(spacing: 12) {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 34, weight: .regular))
+                    .foregroundStyle(Color.accentColor.opacity(0.85))
+                Text("Ask Beacon to find something")
+                    .font(.system(size: 16, weight: .semibold))
+                Text("Describe it in your own words — a file, a message, an email, "
+                     + "a note — and Beacon's AI will track down where it lives.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 420)
+                if !aiSettings.hasKey {
+                    Text("Add your API key in Manage to get started.")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(Color.accentColor)
+                        .padding(.top, 2)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding(24)
+        }
     }
 
     private func externalSourcePrompt(_ requirement: ExternalSourceRequirement) -> some View {
@@ -1729,6 +1842,8 @@ struct SearchView: View {
         Group {
             if let activePreview {
                 previewFooter(activePreview)
+            } else if engine.aiMode && !filterLayout.isEditing {
+                aiFooter
             } else {
                 VStack(spacing: 0) {
                     if engine.selectedType == .history && engine.historySafariDenied {
@@ -1738,6 +1853,229 @@ struct SearchView: View {
                 }
             }
         }
+    }
+
+    /// AI-mode footer: the keyboard hints are replaced by a Manage button and a
+    /// prominent Send, sitting next to Quit. Send is how you submit your prompt.
+    private var aiFooter: some View {
+        HStack(spacing: 12) {
+            if engine.aiRunning {
+                ProgressView().controlSize(.small)
+                Text(engine.aiStatus.isEmpty ? "Working…" : engine.aiStatus)
+                    .font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+            } else {
+                Text("Ask in plain language, then Send.")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button { openAIManage() } label: {
+                footerControlLabel("Manage", systemImage: "gearshape")
+            }
+            .buttonStyle(.plain)
+            .help("Manage your AI provider, key, and sources")
+
+            Button { sendAIMessage() } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "paperplane.fill").font(.system(size: 10, weight: .semibold))
+                    Text("Send message").font(.system(size: 10, weight: .semibold))
+                }
+                .foregroundStyle(.white)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 4)
+                .background(Capsule().fill(canSendAI ? Color.accentColor : Color.secondary.opacity(0.4)))
+            }
+            .buttonStyle(.plain)
+            .disabled(!canSendAI)
+            .help("Send your question to the AI")
+
+            quitButton
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 9)
+        .background(.ultraThinMaterial)
+        .background(Color.white.opacity(colorScheme == .dark ? 0.015 : 0.08))
+        .overlay(glassDivider, alignment: .top)
+    }
+
+    private var canSendAI: Bool {
+        !engine.aiRunning &&
+        !engine.queryText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private func sendAIMessage() {
+        let q = engine.queryText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty, !engine.aiRunning else { return }
+        lastAISubmitted = q
+        selectedIndex = 0
+        engine.runAIQuery(q)
+        engine.queryText = ""   // clear the composer; the prompt lives in the banner
+    }
+
+    private func openAIManage() {
+        aiKeyDraft = ""
+        showAISettingsPanel = true
+    }
+
+    private func sourceBinding(_ source: AISource) -> Binding<Bool> {
+        Binding(
+            get: { aiSettings.enabledSources.contains(source) },
+            set: { on in
+                if on { aiSettings.enabledSources.insert(source) }
+                else { aiSettings.enabledSources.remove(source) }
+            }
+        )
+    }
+
+    /// In-panel AI settings: paste key (with a clear saved state), pick a model
+    /// with capability/cost notes, and choose which sources the AI may search.
+    private var aiSettingsPanel: some View {
+        ZStack {
+            Color.black.opacity(0.32).ignoresSafeArea()
+                .onTapGesture { showAISettingsPanel = false }
+            VStack(alignment: .leading, spacing: 18) {
+                HStack {
+                    Label("AI settings", systemImage: "sparkles")
+                        .font(.system(size: 16, weight: .semibold))
+                    Spacer()
+                    Button { showAISettingsPanel = false } label: {
+                        Image(systemName: "xmark").font(.system(size: 12, weight: .semibold))
+                    }
+                    .buttonStyle(.plain).foregroundStyle(.secondary)
+                }
+
+                // API key
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("\(aiSettings.provider.displayName) API key")
+                            .font(.system(size: 12, weight: .semibold))
+                        Spacer()
+                        if aiSettings.hasKey {
+                            Label("Key saved", systemImage: "checkmark.circle.fill")
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundStyle(.green)
+                        } else {
+                            Text("No key yet")
+                                .font(.system(size: 11)).foregroundStyle(.secondary)
+                        }
+                    }
+                    HStack(spacing: 8) {
+                        SecureField(aiSettings.hasKey ? "•••••••• (saved) — paste to replace" : "sk-…",
+                                    text: $aiKeyDraft)
+                            .textFieldStyle(.roundedBorder)
+                            .focused($aiKeyFieldFocused)
+                            .onSubmit { saveAIKey() }
+                        Button("Save") { saveAIKey() }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(aiKeyDraft.trimmingCharacters(in: .whitespaces).isEmpty)
+                        if aiSettings.hasKey {
+                            Button("Remove") { aiSettings.apiKey = nil; aiKeyDraft = "" }
+                        }
+                    }
+                }
+
+                // Model picker
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Model").font(.system(size: 12, weight: .semibold))
+                    ForEach(aiSettings.provider.models, id: \.self) { m in
+                        Button { aiSettings.model = m } label: {
+                            HStack(spacing: 10) {
+                                Image(systemName: aiSettings.model == m
+                                      ? "largecircle.fill.circle" : "circle")
+                                    .foregroundStyle(aiSettings.model == m ? Color.accentColor : .secondary)
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(m).font(.system(size: 13, weight: .medium))
+                                    Text(aiSettings.provider.blurb(for: m))
+                                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                            }
+                            .padding(.horizontal, 10).padding(.vertical, 7)
+                            .background(RoundedRectangle(cornerRadius: 9)
+                                .fill(aiSettings.model == m ? Color.accentColor.opacity(0.10) : .clear))
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+
+                // Sources
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Sources the AI may search").font(.system(size: 12, weight: .semibold))
+                    LazyVGrid(columns: [GridItem(.flexible(), alignment: .leading),
+                                        GridItem(.flexible(), alignment: .leading)],
+                              spacing: 4) {
+                        ForEach(AISource.allCases) { source in
+                            Toggle(isOn: sourceBinding(source)) {
+                                Text(source.displayName).font(.system(size: 12))
+                            }
+                            .toggleStyle(.checkbox)
+                        }
+                    }
+                    Text("Messages & Mail need Full Disk Access.")
+                        .font(.system(size: 10)).foregroundStyle(.tertiary)
+                }
+
+                HStack {
+                    Spacer()
+                    Button("Done") { showAISettingsPanel = false }
+                        .keyboardShortcut(.defaultAction)
+                        .buttonStyle(.borderedProminent)
+                }
+            }
+            .padding(24)
+            .frame(width: 460)
+            .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(.regularMaterial))
+            .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.12)))
+            .shadow(radius: 24, y: 8)
+        }
+        .onExitCommand { showAISettingsPanel = false }
+        .onAppear { aiKeyFieldFocused = true }
+    }
+
+    private func saveAIKey() {
+        let k = aiKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !k.isEmpty else { return }
+        aiSettings.apiKey = k
+        aiKeyDraft = ""
+        aiKeyFieldFocused = false
+    }
+
+    /// In AI mode this line shows the most-recently-sent prompt. Click it to pull
+    /// the prompt back into the field to edit and re-send. Before any prompt, a
+    /// faint hint.
+    private var aiBanner: some View {
+        Button {
+            guard let q = lastAISubmitted, !q.isEmpty else { return }
+            engine.queryText = q
+            engine.focusRequestToken &+= 1
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Color.accentColor)
+                if let q = lastAISubmitted, !q.isEmpty {
+                    Text(q)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Image(systemName: "pencil")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                } else {
+                    Text("Ask Beacon to find something…")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+            .contentShape(Rectangle())
+            .padding(.horizontal, 18)
+            .padding(.vertical, 11)
+        }
+        .buttonStyle(.plain)
+        .disabled(lastAISubmitted == nil)
     }
 
     private func previewFooter(_ preview: ActivePreview) -> some View {
@@ -1988,6 +2326,77 @@ struct SearchView: View {
         selectedIndex = 0
         selection = []
         selectionAnchor = nil
+    }
+
+    /// Enter behavior: in AI mode a fresh question runs the agent; once results
+    /// are shown, Enter opens the highlighted one (edit the question to re-ask).
+    private func handleSubmit() {
+        guard engine.aiMode else { openSelected(); return }
+        let q = engine.queryText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if q != (lastAISubmitted ?? "") || engine.results.isEmpty {
+            lastAISubmitted = q
+            selectedIndex = 0
+            engine.runAIQuery(q)
+            engine.queryText = ""   // clear the composer; the prompt lives in the banner
+        } else {
+            openSelected()
+        }
+    }
+
+    private func toggleAIMode() {
+        if engine.aiMode {
+            engine.aiMode = false
+            lastAISubmitted = nil
+            return
+        }
+        // First-run: gate on the privacy disclosure before enabling.
+        if !AISettings.shared.privacyDisclosed {
+            showAIDisclosure = true
+            return
+        }
+        engine.aiMode = true
+    }
+
+    /// First-run privacy disclosure for AI mode. Opt-in and explicit: it makes
+    /// clear that matched snippets leave the device to the user's own provider.
+    private var aiDisclosureOverlay: some View {
+        ZStack {
+            Color.black.opacity(0.28).ignoresSafeArea()
+                .onTapGesture { showAIDisclosure = false }
+            VStack(spacing: 14) {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 30, weight: .semibold))
+                    .foregroundStyle(Color.accentColor)
+                Text("Turn on AI mode?")
+                    .font(.system(size: 18, weight: .semibold))
+                Text("AI mode uses your own AI provider and API key. When you ask "
+                     + "a question, matched snippets from the sources you enable "
+                     + "are sent to that provider under your account to find your "
+                     + "results. Normal Beacon search stays fully local. You can "
+                     + "turn this off anytime.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 380)
+                HStack(spacing: 10) {
+                    Button("Not now") { showAIDisclosure = false }
+                        .keyboardShortcut(.cancelAction)
+                    Button("Turn on AI mode") {
+                        AISettings.shared.privacyDisclosed = true
+                        showAIDisclosure = false
+                        engine.aiMode = true
+                    }
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
+                }
+            }
+            .padding(26)
+            .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(.regularMaterial))
+            .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.12)))
+            .shadow(radius: 20, y: 6)
+        }
+        .onExitCommand { showAIDisclosure = false }
     }
 
     private func cycleFilter(forward: Bool) {

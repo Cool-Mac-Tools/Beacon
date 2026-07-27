@@ -71,10 +71,28 @@ cp "$ROOT/Resources/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
 cp -R "$ROOT/Vendor/Sparkle.framework" "$APP_BUNDLE/Contents/Frameworks/"
 printf 'APPL????' > "$APP_BUNDLE/Contents/PkgInfo"
 
-echo "==> Ad-hoc signing..."
-codesign --force --deep --sign - "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework" >/dev/null 2>&1 || true
-codesign --force --deep --entitlements "$ROOT/Resources/Beacon.entitlements" --sign - "$APP_BUNDLE" >/dev/null 2>&1 || \
-  codesign --force --entitlements "$ROOT/Resources/Beacon.entitlements" --sign - "$APP_BUNDLE"
+# Prefer a stable local signing identity so macOS permissions (Full Disk
+# Access, etc.) persist across rebuilds instead of resetting every time the
+# ad-hoc signature changes. Create it once in Keychain Access:
+#   Certificate Assistant -> Create a Certificate -> name "Beacon Local Dev",
+#   type "Code Signing". Falls back to ad-hoc ("-") when it's absent.
+SIGN_ID="-"; SIGN_NAME="ad-hoc"
+for pref in "Developer ID Application" "Apple Development" "Beacon Local Dev"; do
+  line="$(security find-identity -v -p codesigning 2>/dev/null | grep -m1 "$pref" || true)"
+  if [ -n "$line" ]; then
+    SIGN_ID="$(echo "$line" | awk '{print $2}')"   # SHA-1 hash, robust
+    SIGN_NAME="$pref"
+    break
+  fi
+done
+if [ "$SIGN_ID" = "-" ]; then
+  echo "==> Ad-hoc signing (no stable identity; FDA won't persist across rebuilds)..."
+else
+  echo "==> Signing with '$SIGN_NAME' (permissions persist across rebuilds)..."
+fi
+codesign --force --deep --sign "$SIGN_ID" "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework" >/dev/null 2>&1 || true
+codesign --force --deep --entitlements "$ROOT/Resources/Beacon.entitlements" --sign "$SIGN_ID" "$APP_BUNDLE" >/dev/null 2>&1 || \
+  codesign --force --entitlements "$ROOT/Resources/Beacon.entitlements" --sign "$SIGN_ID" "$APP_BUNDLE"
 
 echo "==> Relaunching..."
 # Quit any running instance so the new build takes over.
