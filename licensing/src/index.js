@@ -1,26 +1,34 @@
 /**
- * Beacon license server — Cloudflare Worker.
+ * Beacon license server — Cloudflare Worker (Stripe).
+ *
+ * Stripe is a payment processor, not a merchant of record, and it does NOT
+ * generate license keys. So unlike the old Lemon Squeezy flow (where LS minted
+ * and emailed the key), we mint the key ourselves against a paid Checkout
+ * Session, then validate it against the subscription's live status.
  *
  * Endpoints:
- *   POST /validate {key}            -> validates a Lemon Squeezy license key and
- *                                      confirms it belongs to Beacon's store.
- *   POST /claim    {transactionId}  -> [DORMANT] Paddle mint path, kept so we
- *                                      can flip back to Paddle once approved.
+ *   POST /claim    {sessionId}  -> verifies a Stripe Checkout Session is paid
+ *                                  (or in its free trial) for Beacon's price,
+ *                                  mints+stores a BEACON key (idempotent per
+ *                                  session), and returns it. Called by the
+ *                                  post-purchase thanks page.
+ *   POST /validate {key}        -> looks up the stored key and confirms the
+ *                                  Stripe subscription is still active/trialing.
  *
- * Lemon Squeezy generates and delivers the license key itself (on the post-
- * purchase screen and receipt email), so there's no minting to do here — the
- * app just pastes the key and we validate it. Validation is keyless (LS's
- * validate endpoint is authenticated by the key), but we MUST confirm the key
- * came from OUR store/product, because LS's endpoint validates any key from any
- * store. KV layout:
- *   status:<KEY>           -> {valid, expiresAt} (24h cache of LS status)
- *   (Paddle-era keys) license:<KEY>, txn:<ID>    (unused going forward)
+ * KV (LICENSES) layout:
+ *   session:<SESSION_ID>  -> KEY            (idempotency for /claim)
+ *   license:<KEY>         -> {subscriptionId, customerId, email, createdAt}
+ *   status:<KEY>          -> {valid, expiresAt}   (24h cache of /validate)
+ *
+ * Secrets/vars (wrangler):
+ *   STRIPE_SECRET_KEY  (secret) — set via `wrangler secret put STRIPE_SECRET_KEY`
+ *   STRIPE_PRICE_ID    (var)    — the recurring yearly price the key must be for
  */
 
-const LS_API = "https://api.lemonsqueezy.com/v1/licenses/validate";
-const PADDLE_API = "https://api.paddle.com";
+const STRIPE_API = "https://api.stripe.com/v1";
 // Unambiguous alphabet: no 0/O/1/I/L.
 const KEY_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
+const KEY_RE = /^BEACON-[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}$/;
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -49,128 +57,114 @@ function generateKey() {
   return `BEACON-${groups.join("-")}`;
 }
 
-async function paddle(env, path) {
-  const res = await fetch(`${PADDLE_API}${path}`, {
-    headers: { Authorization: `Bearer ${env.PADDLE_API_KEY}` },
+/** GET a Stripe resource. `params` become repeated query args (for expand[]). */
+async function stripe(env, path, params = []) {
+  const qs = params.length ? `?${params.join("&")}` : "";
+  const res = await fetch(`${STRIPE_API}${path}${qs}`, {
+    headers: {
+      Authorization: `Bearer ${env.STRIPE_SECRET_KEY}`,
+      Accept: "application/json",
+    },
   });
   if (!res.ok) {
-    throw new Error(`paddle ${path} -> ${res.status}`);
+    throw new Error(`stripe ${path} -> ${res.status}`);
   }
-  const body = await res.json();
-  return body.data;
+  return res.json();
 }
 
 async function handleClaim(request, env) {
-  const { transactionId } = await request.json().catch(() => ({}));
-  if (!transactionId || !/^txn_[a-z0-9]+$/.test(transactionId)) {
-    return json({ error: "missing or malformed transactionId" }, 400);
+  const { sessionId } = await request.json().catch(() => ({}));
+  if (!sessionId || !/^cs_[A-Za-z0-9_]+$/.test(sessionId)) {
+    return json({ error: "missing or malformed sessionId" }, 400);
   }
 
   // Idempotent: a refresh of the thanks page returns the same key.
-  const existing = await env.LICENSES.get(`txn:${transactionId}`);
+  const existing = await env.LICENSES.get(`session:${sessionId}`);
   if (existing) {
     return json({ key: existing });
   }
 
-  let txn;
+  let session;
   try {
-    txn = await paddle(env, `/transactions/${transactionId}`);
+    session = await stripe(env, `/checkout/sessions/${sessionId}`, [
+      "expand[]=line_items",
+    ]);
   } catch {
-    return json({ error: "transaction not found" }, 404);
-  }
-  const paidStates = ["completed", "paid"];
-  if (!paidStates.includes(txn.status)) {
-    return json({ error: `transaction not completed (${txn.status})` }, 402);
-  }
-  const boughtBeacon = (txn.items || []).some(
-    (item) => item.price?.id === env.PADDLE_PRICE_ID
-  );
-  if (!boughtBeacon) {
-    return json({ error: "transaction is not for Beacon" }, 402);
+    return json({ error: "session not found" }, 404);
   }
 
-  let email = "";
-  try {
-    if (txn.customer_id) {
-      const customer = await paddle(env, `/customers/${txn.customer_id}`);
-      email = customer.email || "";
-    }
-  } catch {
-    // Email is a nicety for support lookups; never block the claim on it.
+  // A completed session for a subscription is legitimate even during a free
+  // trial, when nothing has been charged yet (payment_status is then
+  // "no_payment_required"). So gate on completion, not on a captured payment.
+  const paidStates = ["paid", "no_payment_required"];
+  const completed =
+    session.status === "complete" || paidStates.includes(session.payment_status);
+  if (!completed) {
+    return json({ error: `checkout not complete (${session.status})` }, 402);
+  }
+
+  const boughtBeacon = (session.line_items?.data || []).some(
+    (item) => item.price?.id === env.STRIPE_PRICE_ID
+  );
+  if (!boughtBeacon) {
+    return json({ error: "session is not for Beacon" }, 402);
   }
 
   const key = generateKey();
   const record = {
-    subscriptionId: txn.subscription_id || null,
-    customerId: txn.customer_id || null,
-    transactionId,
-    email,
+    subscriptionId: session.subscription || null,
+    customerId: session.customer || null,
+    email: session.customer_details?.email || "",
     createdAt: new Date().toISOString(),
   };
   await env.LICENSES.put(`license:${key}`, JSON.stringify(record));
-  await env.LICENSES.put(`txn:${transactionId}`, key);
+  await env.LICENSES.put(`session:${sessionId}`, key);
   return json({ key });
 }
 
 async function subscriptionStatus(env, record) {
-  // No subscription id (one-off transaction): treat as perpetual for the
-  // year covered by the purchase; Paddle subscriptions are the normal path.
+  // No subscription id (e.g. a one-off charge): treat as perpetual.
   if (!record.subscriptionId) {
     return { valid: true, expiresAt: null };
   }
-  const sub = await paddle(env, `/subscriptions/${record.subscriptionId}`);
+  const sub = await stripe(env, `/subscriptions/${record.subscriptionId}`);
   const activeStates = ["active", "trialing", "past_due"];
   const valid = activeStates.includes(sub.status);
-  const expiresAt = sub.current_billing_period?.ends_at || null;
+  const expiresAt = sub.current_period_end
+    ? new Date(sub.current_period_end * 1000).toISOString()
+    : null;
   return { valid, expiresAt };
 }
 
 async function handleValidate(request, env) {
   const { key } = await request.json().catch(() => ({}));
-  // LS keys are lowercase UUIDs; the app uppercases before sending, so undo it.
-  const normalized = (key || "").trim().toLowerCase();
-  // Loose sanity check (UUID-ish); the real check is LS + store match below.
-  if (!/^[a-f0-9-]{16,64}$/.test(normalized)) {
+  // The app trims + uppercases before sending; keys are our BEACON- format.
+  const normalized = (key || "").trim().toUpperCase();
+  if (!KEY_RE.test(normalized)) {
     return json({ valid: false, error: "malformed key" }, 400);
   }
 
-  // Serve a cached verdict for a day so app launches don't hammer LS.
+  // Serve a cached verdict for a day so app launches don't hammer Stripe.
   const cached = await env.LICENSES.get(`status:${normalized}`, "json");
   if (cached) {
     return json(cached);
   }
 
-  let ls;
+  const record = await env.LICENSES.get(`license:${normalized}`, "json");
+  if (!record) {
+    return json({ valid: false, error: "unknown key" });
+  }
+
+  let verdict;
   try {
-    const res = await fetch(LS_API, {
-      method: "POST",
-      headers: {
-        Accept: "application/json",
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
-      body: new URLSearchParams({ license_key: normalized }),
-    });
-    ls = await res.json();
+    verdict = await subscriptionStatus(env, record);
   } catch {
-    // LS briefly unreachable and no cached verdict: fail closed but DON'T cache
-    // it. The app keeps its prior state (background revalidation ignores
-    // failures) and its 14-day offline grace covers transient outages.
+    // Stripe briefly unreachable and no cached verdict: fail closed but DON'T
+    // cache it. The app keeps its prior state (background revalidation ignores
+    // failures) and its offline grace window covers transient outages.
     return json({ valid: false, error: "validator unreachable", degraded: true }, 503);
   }
 
-  const lk = ls.license_key || {};
-  const meta = ls.meta || {};
-  // Product match is the primary guard (LS product IDs are globally unique).
-  // Store match is an optional extra check, enforced only if LS_STORE_ID is set.
-  const productOK = String(meta.product_id) === String(env.LS_PRODUCT_ID);
-  const storeOK =
-    !env.LS_STORE_ID || String(meta.store_id) === String(env.LS_STORE_ID);
-  // `inactive` = purchased but not yet activated on a device — still a paid,
-  // legitimate key. `expired`/`disabled` = lapsed subscription or revoked.
-  const statusOK = lk.status === "active" || lk.status === "inactive";
-  const valid = ls.valid === true && statusOK && storeOK && productOK;
-
-  const verdict = { valid, expiresAt: lk.expires_at || null };
   await env.LICENSES.put(`status:${normalized}`, JSON.stringify(verdict), {
     expirationTtl: 60 * 60 * 24,
   });

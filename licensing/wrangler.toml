@@ -7,17 +7,13 @@ routes = [
   { pattern = "license.beaconmac.com", custom_domain = true }
 ]
 
-# Public identifiers only (no secrets). LS_STORE_ID / LS_PRODUCT_ID scope
-# license validation to Beacon's own store+product, so a license key from any
-# other Lemon Squeezy store can't unlock Beacon. Fill these from the LS
-# dashboard (Settings → Stores for the store ID; the product page URL / API for
-# the product ID). PADDLE_PRICE_ID is kept for the dormant Paddle claim path.
+# Public identifiers only (no secrets). STRIPE_PRICE_ID scopes license minting
+# to Beacon's own recurring price, so a paid Stripe session for anything else
+# can't mint a Beacon key. Copy it from the Stripe dashboard (Product → Pricing,
+# the price row's "price_..." id). The secret key is NOT here — set it with:
+#   cd licensing && npx wrangler secret put STRIPE_SECRET_KEY
 [vars]
-# LS product IDs are globally unique, so matching the product alone scopes
-# validation to Beacon. LS_STORE_ID is an optional extra guard (leave blank).
-LS_STORE_ID = ""
-LS_PRODUCT_ID = "1241992"
-PADDLE_PRICE_ID = "pri_01kxvfwbt3n2www7ahy6ep68fp"
+STRIPE_PRICE_ID = "REPLACE_WITH_price_id"
 
 [[kv_namespaces]]
 binding = "LICENSES"
