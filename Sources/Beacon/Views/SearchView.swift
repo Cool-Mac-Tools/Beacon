@@ -183,6 +183,11 @@ struct SearchView: View {
             engine.refinementLayoutChanged()
         }
         .onChange(of: filterLayout.isEditing) { editing in
+            // Editing means dragging filter pills to reorder them. Turn OFF
+            // window-background dragging while editing so a pill drag reorders
+            // the pill instead of moving the whole panel; restore it after.
+            (NSApp.windows.first { $0 is SearchPanel } as? SearchPanel)?
+                .isMovableByWindowBackground = !editing
             if editing {
                 engine.queryText = ""
                 selectedIndex = 0

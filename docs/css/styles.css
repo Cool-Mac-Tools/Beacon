@@ -1363,6 +1363,8 @@ body.menu-open { overflow: hidden; }
 }
 
 @media (max-width: 734px) {
+  /* Drop the logo glyph in the mobile top bar — text wordmark only. */
+  .globalnav-logo svg { display: none; }
   .subnav-links { display: none; }
   .subnav-inner { display: flex; justify-content: flex-start; gap: 9px; }
   .subnav .nav-menu-button { display: block; order: 1; }
