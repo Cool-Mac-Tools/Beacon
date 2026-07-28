@@ -20,10 +20,11 @@ final class SearchPanel: NSPanel {
         standardWindowButton(.miniaturizeButton)?.isHidden = true
         standardWindowButton(.zoomButton)?.isHidden = true
 
-        // Window-background dragging is OFF so a drag beginning on a result row
-        // drags that item out of Beacon instead of moving the whole panel. The
-        // panel stays repositionable via the header's WindowMoveArea.
-        isMovableByWindowBackground = false
+        // Drag any empty chrome (top strip, side margins, footer gaps) to move
+        // the panel. Result rows override mouseDownCanMoveWindow to false and
+        // handle their own drag (see ResultInteractionView), so a drag beginning
+        // on a row still drags that *item* out of Beacon rather than the window.
+        isMovableByWindowBackground = true
         isOpaque = false
         backgroundColor = .clear
         hasShadow = true

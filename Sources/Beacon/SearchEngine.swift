@@ -920,6 +920,10 @@ final class SearchEngine: ObservableObject {
     }
 
     private func restoreViewSnapshotIfAvailable() {
+        // AI mode owns `results` via aiPublish only. Restoring a cached snapshot
+        // of a prior normal search (e.g. recents) would leak file/app rows into
+        // the AI results area mid-run.
+        if aiMode { return }
         let key = viewSnapshotKey(
             type: selectedType,
             query: queryText,
@@ -1441,6 +1445,7 @@ final class SearchEngine: ObservableObject {
 
     /// Filter the loaded children by the current tokens and publish a page.
     private func applyDrillResults() {
+        if aiMode { return }   // AI mode owns `results` via aiPublish only
         let tokens = currentTokens
         let rows: [SearchResult]
         if tokens.isEmpty {

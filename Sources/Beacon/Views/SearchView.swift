@@ -1334,9 +1334,9 @@ struct SearchView: View {
     private var aiResultsArea: some View {
         if engine.needsFullDiskAccess {
             fullDiskAccessPrompt
-        } else if !engine.results.isEmpty {
-            resultsList
         } else if engine.aiRunning {
+            // While the agent is working, always show the loading state — never
+            // any stale/leaked results underneath it.
             VStack(spacing: 14) {
                 ProgressView().controlSize(.large)
                 Text(aiLoadingPhrases[aiPhraseIndex % aiLoadingPhrases.count])
@@ -1355,6 +1355,8 @@ struct SearchView: View {
             .onReceive(aiPhraseTimer) { _ in
                 if engine.aiRunning { withAnimation(.easeInOut(duration: 0.35)) { aiPhraseIndex += 1 } }
             }
+        } else if !engine.results.isEmpty {
+            resultsList
         } else {
             VStack(spacing: 12) {
                 Image(systemName: "sparkles")
