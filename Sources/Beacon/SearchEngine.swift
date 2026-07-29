@@ -1386,8 +1386,22 @@ final class SearchEngine: ObservableObject {
         case .folders:
             return Array(dated(folderStore.search(tokens: tokens, limit: wide).map { SearchResult(folder: $0) }).prefix(limit))
         case .files:
-            // v1: recent files (synchronous). Full Spotlight file search is a
-            // follow-up (NSMetadataQuery is async / MDQuery is the sync upgrade).
+            // Full-disk Spotlight (MDQuery) — finds files beyond the recents
+            // window, hard-filtered by type + date in the query itself.
+            let hits = SpotlightFileSearch.search(tokens: tokens, fileType: fileType,
+                                                  after: after, before: before, limit: wide)
+            if !hits.isEmpty {
+                let rows = hits.map { hit in
+                    SearchResult(id: hit.path, name: hit.name, path: hit.path,
+                                 kind: hit.kind, size: nil,
+                                 modified: hit.modified, lastUsed: nil, dateAdded: nil,
+                                 isFolder: hit.isFolder, isApp: false,
+                                 contentTypes: hit.contentType.map { [$0] } ?? [],
+                                 matchKind: .name)
+                }
+                return Array(rows.prefix(limit))
+            }
+            // Fallback to recent files (e.g. a type-only browse Spotlight declined).
             let recs = recentsStore.search(tokens: tokens, limit: wide)
                 .filter { Self.matchesFileType($0.contentTypes, kind: $0.kind, path: $0.path, want: fileType) }
                 .map { SearchResult(recent: $0) }

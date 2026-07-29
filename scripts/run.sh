@@ -56,6 +56,7 @@ if ! swift build -c "$CONFIG"; then
     -framework UniformTypeIdentifiers \
     -framework QuickLook \
     -framework QuickLookThumbnailing \
+    -framework CoreServices \
     -lsqlite3
 fi
 
