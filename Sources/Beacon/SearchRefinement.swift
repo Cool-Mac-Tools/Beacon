@@ -337,6 +337,7 @@ enum RefinementCatalog {
 
     private static func mediaLocation() -> RefinementDimension {
         .init("location", "Location", options: [
+            .init("photos-library", "Photo Library"),
             .init("movies", "Movies"), .init("desktop", "Desktop"),
             .init("downloads", "Downloads"), .init("projects", "Projects")
         ])
@@ -512,6 +513,7 @@ enum RefinementCatalog {
 
     private static func photoSource() -> RefinementDimension {
         .init("photo-source", "Source", options: [
+            .init("photos-library", "Photo Library"),
             .init("screenshots", "Screenshots"), .init("downloads", "Downloads"),
             .init("desktop", "Desktop")
         ])
