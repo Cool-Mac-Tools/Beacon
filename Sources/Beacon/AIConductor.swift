@@ -17,6 +17,12 @@ enum AIConductor {
     // focused searches and read threads, not wade through one huge list. Keeps
     // each round's context (and therefore latency) down.
     private static let perSearchCap = 15
+    // When the query is narrowed by a hard filter (sender/date/type), return a
+    // larger set so the model can read through it for an item whose own text
+    // doesn't contain the keywords.
+    private static let filteredCap = 50
+    // Never show a giant wall of results — cap what actually gets published.
+    private static let maxPresent = 10
 
     // MARK: - Neutral transcript & tool call
 
@@ -42,13 +48,15 @@ enum AIConductor {
 
     static func run(query: String, engine: SearchEngine) {
         let settings = AISettings.shared
-        let provider = settings.provider
-        guard let key = settings.apiKey, !key.isEmpty else {
-            engine.aiSetStatus("Add your \(provider.displayName) API key in Manage to use AI mode.")
+        // Use whichever provider actually has a key (falls back off the selected
+        // tab so viewing a keyless provider doesn't dead-end the query).
+        let provider = settings.effectiveProvider
+        guard let key = settings.apiKey(for: provider), !key.isEmpty else {
+            engine.aiSetStatus("Add an API key in Manage to use AI mode.")
             engine.aiPublish([])
             return
         }
-        let model = settings.model
+        let model = settings.model(for: provider)
         let enabled = AISource.allCases.filter { settings.enabledSources.contains($0) }
         guard !enabled.isEmpty else {
             engine.aiSetStatus("No sources enabled for AI mode.")
@@ -98,20 +106,35 @@ enum AIConductor {
                     let refs = (args["refs"] as? [Any])?.compactMap { intFrom($0) } ?? []
                     let chosen = refs.compactMap { $0 >= 0 && $0 < pool.count ? pool[$0] : nil }
                     engine.aiSetStatus("")
-                    engine.aiPublish(chosen.isEmpty ? pool : chosen)
+                    // Honor the model's ranking (best first); cap the count so a
+                    // sloppy "present everything" can't wall the user.
+                    engine.aiPublish(Array((chosen.isEmpty ? pool : chosen).prefix(maxPresent)))
                     return
                 }
 
                 if name == "search" {
                     let sourceRaw = args["source"] as? String ?? ""
                     let keywords = args["keywords"] as? String ?? ""
-                    let limit = min(intFrom(args["limit"] ?? 0) ?? perSearchCap, perSearchCap)
+                    let from = (args["from"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let fileType = (args["fileType"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let after = parseDay(args["after"], endOfDay: false)
+                    let before = parseDay(args["before"], endOfDay: true)
+                    // When a hard filter (sender/date/type) has narrowed the set,
+                    // hand the model the WHOLE set so it can read to find items
+                    // whose own text lacks the keywords (raw credentials, codes).
+                    let isFiltered = (from?.isEmpty == false) || after != nil || before != nil
+                        || (fileType?.isEmpty == false)
+                    let cap = isFiltered ? filteredCap : perSearchCap
+                    let limit = min(intFrom(args["limit"] ?? 0) ?? cap, cap)
                     let source = AISource(rawValue: sourceRaw)
                     if let source, sources.contains(source) {
                         engine.aiSetStatus("Searching \(source.displayName)…")
                         let tokens = SearchText.tokens(keywords)
-                        let rows = engine.aiToolSearch(source, tokens: tokens,
-                                                       limit: limit > 0 ? limit : perSearchCap)
+                        let rows = engine.aiToolSearch(
+                            source, tokens: tokens, limit: limit > 0 ? limit : perSearchCap,
+                            from: (from?.isEmpty == false) ? from : nil,
+                            after: after, before: before,
+                            fileType: (fileType?.isEmpty == false) ? fileType : nil)
                         var refsForThisCall: [[String: Any]] = []
                         for row in rows {
                             let ref = poolRef(for: row, pool: &pool, ids: &poolIDs)
@@ -148,50 +171,95 @@ enum AIConductor {
             turns.append(.toolResults(results))
         }
 
-        // Ran out of rounds without an explicit selection — publish the pool.
+        // Ran out of rounds without committing. Rather than dumping the whole
+        // accumulated pool (unordered, noisy — the answer buried among unrelated
+        // hits), force ONE decisive pick from what's already been surfaced.
+        engine.aiSetStatus("Finishing…")
+        turns.append(.user("Stop searching. From the results you've already seen, call present_results NOW with only the ref(s) that best answer the request — usually exactly one item that IS the answer."))
+        if let response = chat(provider: provider, key: key, model: model,
+                               system: system, tools: tools, turns: turns),
+           let call = response.toolCalls.first(where: { $0.name == "present_results" }) {
+            let refs = (call.args["refs"] as? [Any])?.compactMap { intFrom($0) } ?? []
+            let chosen = refs.compactMap { $0 >= 0 && $0 < pool.count ? pool[$0] : nil }
+            if !chosen.isEmpty {
+                engine.aiSetStatus("")
+                engine.aiPublish(Array(chosen.prefix(maxPresent)))
+                return
+            }
+        }
+        // Last resort: a few candidates, never the full pool.
         engine.aiSetStatus("")
-        engine.aiPublish(pool)
+        engine.aiPublish(Array(pool.prefix(maxPresent)))
     }
 
     // MARK: - Prompt & tool specs
 
     private static func systemPrompt(sources: [AISource]) -> String {
         let list = sources.map(\.displayName).joined(separator: ", ")
+        let today = dayParser.string(from: Date())
         return """
-        You are Beacon's search agent. The user describes — often vaguely, from \
-        memory — something on their Mac they want to find. Your job is to locate \
-        the specific item(s) that answer the request and return them as locations, \
-        never as prose.
+        You are Beacon's search agent. Today is \(today). The user describes — \
+        often vaguely, from memory — something on their Mac. Return the specific \
+        item(s) as locations, never as prose.
+
+        FIRST decompose the request into every constraint given, and pass EACH as \
+        a filter — not just keywords. The more constraints you apply, the fewer \
+        and sharper the results:
+        • WHO — a person/sender → `from` (e.g. "Sean M").
+        • CONTENT — words likely in or near the item → `keywords`.
+        • TYPE — messages, mail, notes, files, an image, a pdf… → pick `source`, \
+        and for the files source set `fileType` (image/pdf/document/audio/video/folder).
+        • WHEN — an exact or rough date range → `after`/`before` as YYYY-MM-DD, \
+        resolved against today. "between May 20 and June 1" → after=2026-05-20, \
+        before=2026-06-01. "late May" → that span. "2–3 months ago" → a window a \
+        few weeks wide centered ~10 weeks back.
+
+        Never run a bare keyword search when the user gave you a sender, a type, \
+        or a date — that returns dozens of irrelevant hits. Filter hard first.
+
+        Disambiguate SOURCE from CONTENT. "an email and password", "login", \
+        "credentials", "the password for my/his account" describe a shared LOGIN \
+        — the "email" is an address, NOT the Mail app. People share logins in \
+        Messages, so search Messages first for these; only use the mail source \
+        when the user clearly means the Mail app (a subject, an email thread, a \
+        sender's email). If the user names the source ("in messages", "over \
+        text", "in my email"), obey it exactly.
+
+        When the item's OWN text won't contain your words — a raw email+password, \
+        a login, a verification code, a phone number, an address — do NOT pass \
+        keywords (they'd exclude the very thing you want). Instead filter by \
+        `from` + date (+ type), which returns the whole narrowed set, and READ \
+        those results to spot the one that looks like the answer.
 
         Tools:
-        - `search(source, keywords)` across these sources: \(list). Search is \
-        keyword-based. Message results include `from` (sender) and `date`.
-        - `read_thread(ref)` reads the conversation around a message result, in \
-        time order.
-        - `present_results(refs)` finishes the task.
+        - search(source, keywords?, from?, after?, before?, fileType?) across: \(list). \
+        Message results also carry from/date.
+        - read_thread(ref) — read the conversation around a message result. The \
+        item you need is often a neighbouring message with none of the keywords \
+        (a raw email+password sent right after a message about the topic).
+        - present_results(refs) — finish. List ONLY the ref(s) that answer the \
+        request, best first. For a SPECIFIC item (a credential, a code, an \
+        address, one particular file/message), present EXACTLY ONE — the single \
+        item that IS the answer — not a list of maybes.
 
-        Strategy — follow it:
-        1. Pull apart the request into WHO (a person/sender), WHAT (the topic or \
-        the kind of thing), and WHEN (any date range). Search using the person's \
-        name AND the topic as keywords; run several focused searches with \
-        different keyword combinations rather than one broad query.
-        2. THE ITEM YOU NEED OFTEN DOES NOT CONTAIN THE OBVIOUS KEYWORDS. Example: \
-        an email address + password someone texted will not contain the words \
-        "email", "password", or the account name — those appear in the messages \
-        around it. So when a Messages search surfaces a plausible thread or a \
-        message near the topic (right person, right timeframe), call \
-        `read_thread` on it and look at the neighbouring messages for the actual \
-        answer (a raw email/login, a phone number, an address, a code).
-        3. Honour WHO and WHEN: prefer messages whose `from` matches the named \
-        person and whose `date` falls in the requested range. Use these to pick \
-        between candidates and to discard unrelated hits.
-        4. Finish with `present_results` listing ONLY the few refs that directly \
-        answer the request, most relevant first — ideally 1–3. Do not dump every \
-        keyword match. If you genuinely cannot find it, present your closest \
-        candidates.
+        Be decisive and fast: usually ONE well-filtered search is enough. The \
+        moment a search returns a strong candidate, STOP — read it and call \
+        present_results. Do not keep running more searches, and never present the \
+        raw filtered list; pick the answer out of it.
 
-        Only call tools; never write explanations. Always finish by calling \
-        `present_results`.
+        Examples:
+        • "the email & password Sean sent me over text in May 2026" \
+        → search(source=messages, from="Sean", after="2026-05-01", \
+        before="2026-05-31") with NO keywords (the credentials text won't contain \
+        "email"/"password"), then READ the returned messages and present the one \
+        that looks like an email address + a password. It may be inside a group \
+        thread — that's fine, `from` still finds Sean's message.
+        • "an image I made ~2–3 months ago of a hooded figure on a white background" \
+        → search(source=files, fileType="image", after=<~3mo ago>, before=<~2mo ago>, \
+        keywords="hooded figure"). Filenames rarely contain the visual content, so \
+        rely on type+date to narrow, then present the most likely.
+
+        Only call tools; never write explanations. Always finish with present_results.
         """
     }
 
@@ -200,18 +268,27 @@ enum AIConductor {
         return [
             ToolSpec(
                 name: "search",
-                description: "Search one source of the user's Mac by keywords. Returns matching items, each with a numeric ref.",
+                description: "Search one source of the user's Mac. Apply every constraint the user gave as a filter — not just keywords — to get a small, precise result set. Returns matching items, each with a numeric ref (message results also carry from/date).",
                 parameters: [
                     "type": "object",
                     "properties": [
                         "source": ["type": "string", "enum": sourceEnum,
                                    "description": "Which source to search."],
                         "keywords": ["type": "string",
-                                     "description": "Space-separated keywords to match."],
+                                     "description": "Words likely in or near the item's content. Optional when a from/date/type filter alone identifies it."],
+                        "from": ["type": "string",
+                                 "description": "Sender/person the item is from (e.g. \"Sean M\"). For messages this hard-filters by contact, even inside a differently-named thread."],
+                        "after": ["type": "string",
+                                  "description": "Only items on or after this date, YYYY-MM-DD."],
+                        "before": ["type": "string",
+                                   "description": "Only items on or before this date, YYYY-MM-DD."],
+                        "fileType": ["type": "string",
+                                     "enum": ["image", "pdf", "document", "audio", "video", "folder"],
+                                     "description": "For the files source: restrict to this kind of file."],
                         "limit": ["type": "integer",
                                   "description": "Max results (default 15)."],
                     ],
-                    "required": ["source", "keywords"],
+                    "required": ["source"],
                 ]
             ),
             ToolSpec(
@@ -259,6 +336,23 @@ enum AIConductor {
         f.dateFormat = "yyyy-MM-dd HH:mm"
         return f
     }()
+
+    private static let dayParser: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        f.locale = Locale(identifier: "en_US_POSIX")
+        return f
+    }()
+
+    /// Parse a model-supplied "YYYY-MM-DD" into a Date. `endOfDay` pushes it to
+    /// 23:59:59 so a `before` bound includes the whole day.
+    private static func parseDay(_ any: Any?, endOfDay: Bool) -> Date? {
+        guard let raw = (any as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              raw.count >= 10,
+              let day = dayParser.date(from: String(raw.prefix(10))) else { return nil }
+        guard endOfDay else { return day }
+        return Calendar.current.date(byAdding: DateComponents(day: 1, second: -1), to: day) ?? day
+    }
 
     /// The dict the model sees for one result. Messages carry `from` and `date`
     /// so the model can honour "from Sean" and "between May 20 and June 1"

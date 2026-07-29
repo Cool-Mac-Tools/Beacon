@@ -37,6 +37,7 @@ struct SearchView: View {
     @State private var lastAISubmitted: String?
     @State private var showAIDisclosure = false
     @State private var showAISettingsPanel = false
+    @State private var showAITips = false
     @State private var aiKeyDraft = ""
     @FocusState private var aiKeyFieldFocused: Bool
     /// Rotating "flavor" line shown under the concrete status while the AI runs,
@@ -159,6 +160,9 @@ struct SearchView: View {
         }
         .overlay {
             if showAISettingsPanel { aiSettingsPanel }
+        }
+        .overlay {
+            if showAITips { aiTipsOverlay }
         }
         .onReceive(NotificationCenter.default.publisher(for: Notification.Name("BeaconOpenAISettings"))) { _ in
             aiKeyDraft = ""
@@ -1375,7 +1379,7 @@ struct SearchView: View {
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: 420)
-                if !aiSettings.hasKey {
+                if !aiSettings.hasAnyKey {
                     Text("Add your API key in Manage to get started.")
                         .font(.system(size: 11, weight: .medium))
                         .foregroundStyle(Color.accentColor)
@@ -1875,6 +1879,12 @@ struct SearchView: View {
                     .font(.system(size: 11)).foregroundStyle(.secondary)
             }
             Spacer()
+            Button { showAITips = true } label: {
+                footerControlLabel("Tips", systemImage: "lightbulb")
+            }
+            .buttonStyle(.plain)
+            .help("How to get the fastest, most accurate results")
+
             Button { openAIManage() } label: {
                 footerControlLabel("Manage", systemImage: "gearshape")
             }
@@ -2058,6 +2068,71 @@ struct SearchView: View {
         }
         .onExitCommand { showAISettingsPanel = false }
         .onAppear { aiKeyFieldFocused = true }
+    }
+
+    /// Best-practices card for AI mode — the more specific the prompt, the faster
+    /// and more accurate the result, because each detail becomes a hard filter.
+    private var aiTipsOverlay: some View {
+        ZStack {
+            Color.black.opacity(0.32).ignoresSafeArea()
+                .onTapGesture { showAITips = false }
+            VStack(alignment: .leading, spacing: 16) {
+                HStack {
+                    Label("Tips for great results", systemImage: "lightbulb.fill")
+                        .font(.system(size: 16, weight: .semibold))
+                    Spacer()
+                    Button { showAITips = false } label: {
+                        Image(systemName: "xmark").font(.system(size: 12, weight: .semibold))
+                    }
+                    .buttonStyle(.plain).foregroundStyle(.secondary)
+                }
+                Text("The more specific you are, the faster and sharper the answer — every detail becomes a filter Beacon can use.")
+                    .font(.system(size: 12)).foregroundStyle(.secondary)
+
+                VStack(alignment: .leading, spacing: 10) {
+                    aiTipRow("person.crop.circle", "Name the person", "Who sent or made it — “from Sean M”.")
+                    aiTipRow("tray.full", "Say where it lives", "A message, an email, a note, a file, an image, a PDF…")
+                    aiTipRow("calendar", "Give a time frame", "Exact (“between May 20 and June 1”) or rough (“about 2 months ago”).")
+                    aiTipRow("text.magnifyingglass", "Describe the content", "Words in or around it, or what an image shows.")
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Example").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
+                    Text("“Find the email & password Sean M sent me in Messages between May 20 and June 1.”")
+                        .font(.system(size: 12, weight: .medium))
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(RoundedRectangle(cornerRadius: 9).fill(Color.accentColor.opacity(0.10)))
+                }
+
+                HStack {
+                    Spacer()
+                    Button("Got it") { showAITips = false }
+                        .keyboardShortcut(.defaultAction)
+                        .buttonStyle(.borderedProminent)
+                }
+            }
+            .padding(24)
+            .frame(width: 440)
+            .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(.regularMaterial))
+            .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.12)))
+            .shadow(radius: 24, y: 8)
+        }
+        .onExitCommand { showAITips = false }
+    }
+
+    private func aiTipRow(_ icon: String, _ title: String, _ detail: String) -> some View {
+        HStack(alignment: .top, spacing: 11) {
+            Image(systemName: icon)
+                .font(.system(size: 15))
+                .foregroundStyle(Color.accentColor)
+                .frame(width: 22)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title).font(.system(size: 13, weight: .semibold))
+                Text(detail).font(.system(size: 12)).foregroundStyle(.secondary)
+            }
+        }
     }
 
     /// Segmented row of provider tabs. Selecting one makes it the active

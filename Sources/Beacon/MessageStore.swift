@@ -133,52 +133,91 @@ final class MessageStore {
     /// superseded by newer keystrokes aborts immediately instead of grinding
     /// through the rest of the history (its partial result is dropped by the
     /// caller's generation check anyway).
+    /// `sender` (already folded), `after`, and `before` are hard filters applied
+    /// during the scan. Sender is matched against the resolved contact name, the
+    /// raw handle, AND the chat/thread name — so "from Sean" finds Sean's
+    /// messages even inside a thread the user titled something else ("Japan").
     func search(tokens: [String], limit: Int = 80,
+                sender: String? = nil, after: Date? = nil, before: Date? = nil,
                 nameResolver: ((String) -> String?)? = nil,
                 isCancelled: (() -> Bool)? = nil) -> [MessageRecord] {
         guard state == .ready else {
             Log.write("MessageStore: search skipped (state=\(state), tokens=\(tokens))")
             return []
         }
-        if tokens.isEmpty { return Array(cache.prefix(limit)) }
-        // A cached result computed before the contact resolver was ready must
-        // not be reused once names become resolvable — "Mom" should start
-        // matching Mom's messages the moment contacts finish loading.
-        if tokens == lastSearchTokens,
-           (nameResolver != nil) == lastSearchUsedResolver {
-            return Array(lastSearchMatches.prefix(limit))
+        let hasFilters = sender != nil || after != nil || before != nil
+        // Fast paths only apply to the plain (unfiltered) case.
+        if !hasFilters {
+            if tokens.isEmpty { return Array(cache.prefix(limit)) }
+            // A cached result computed before the contact resolver was ready must
+            // not be reused once names become resolvable — "Mom" should start
+            // matching Mom's messages the moment contacts finish loading.
+            if tokens == lastSearchTokens,
+               (nameResolver != nil) == lastSearchUsedResolver {
+                return Array(lastSearchMatches.prefix(limit))
+            }
         }
         var out: [(record: MessageRecord, quality: SearchText.MatchQuality)] = []
         for (index, rec) in cache.enumerated() {   // already sorted newest-first
             if index & 0xFF == 0, isCancelled?() == true {
                 return out.map(\.record)
             }
-            // Fast path: match on the precomputed text+handle haystack first;
-            // only fall back to the contact-name lookup when the text misses.
-            let textQuality = SearchText.matchQuality(rec.folded, tokens: tokens)
-            let nameQuality: SearchText.MatchQuality?
-            if let nameResolver,
-               let name = foldedName(for: rec.conversationHandle, resolve: nameResolver) {
-                nameQuality = SearchText.matchQuality(name, tokens: tokens)
+            // Hard filters first — cheapest rejections.
+            if let after, rec.date < after { continue }
+            if let before, rec.date > before { continue }
+
+            // Resolve BOTH the per-message sender (rec.handle — populated even
+            // inside a group chat) and the 1:1 conversation peer. Group messages
+            // have an empty conversationHandle, so without rec.handle "from Sean"
+            // would never match a message Sean sent in a group thread.
+            let senderName = nameResolver.flatMap { foldedName(for: rec.handle, resolve: $0) }
+            let peerName = nameResolver.flatMap { foldedName(for: rec.conversationHandle, resolve: $0) }
+
+            if let sender {
+                if rec.isFromMe { continue }   // "from X" = authored by X, not by me
+                let match = (senderName?.contains(sender) ?? false)
+                    || (peerName?.contains(sender) ?? false)
+                    || rec.handle.searchFolded.contains(sender)
+                    || rec.conversationHandle.searchFolded.contains(sender)
+                    || rec.chatName.searchFolded.contains(sender)
+                if !match { continue }
+            }
+
+            // Keywords RANK when a hard filter (sender/date) already narrowed the
+            // set — they don't exclude. That's what lets a raw email+password
+            // (which contains none of the query words) still surface for the
+            // model to read. A pure keyword search still requires a match.
+            let quality: SearchText.MatchQuality
+            if tokens.isEmpty {
+                quality = .substring   // no content constraint; recency orders these
             } else {
-                nameQuality = nil
+                let textQuality = SearchText.matchQuality(rec.folded, tokens: tokens)
+                let nameQuality = [senderName, peerName].compactMap { $0 }
+                    .compactMap { SearchText.matchQuality($0, tokens: tokens) }.min()
+                if let best = [textQuality, nameQuality].compactMap({ $0 }).min() {
+                    quality = best
+                } else if hasFilters {
+                    quality = .substring   // soft: keep, rank below keyword hits
+                } else {
+                    continue               // pure keyword search: require a match
+                }
             }
-            let quality = [textQuality, nameQuality].compactMap { $0 }.min()
-            if let quality {
-                out.append((rec, quality))
-            }
+            out.append((rec, quality))
         }
         let matches = out
             .sorted {
+                if tokens.isEmpty { return $0.record.date > $1.record.date }
                 if $0.quality != $1.quality { return $0.quality < $1.quality }
                 return $0.record.date > $1.record.date
             }
             .map(\.record)
-        lastSearchTokens = tokens
-        lastSearchMatches = matches
-        lastSearchUsedResolver = nameResolver != nil
+        if !hasFilters {
+            lastSearchTokens = tokens
+            lastSearchMatches = matches
+            lastSearchUsedResolver = nameResolver != nil
+        }
         let results = Array(matches.prefix(limit))
-        Log.write("MessageStore: search tokens=\(tokens) cache=\(cache.count) matched=\(out.count) returned=\(results.count)")
+        Log.write("MessageStore: search tokens=\(tokens) sender=\(sender ?? "-") range=\(after != nil || before != nil) cache=\(cache.count) matched=\(out.count) returned=\(results.count)")
         return results
     }
 

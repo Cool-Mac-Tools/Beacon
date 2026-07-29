@@ -1332,43 +1332,94 @@ final class SearchEngine: ObservableObject {
     /// Run one source's search synchronously and map to SearchResult rows. Called
     /// off the main thread by the AI conductor (on `aiQueue`). This is the bridge
     /// the AI layer uses to reach Beacon's otherwise-private stores.
-    func aiToolSearch(_ source: AISource, tokens: [String], limit: Int) -> [SearchResult] {
-        guard !tokens.isEmpty else { return [] }
+    func aiToolSearch(_ source: AISource, tokens: [String], limit: Int,
+                      from: String? = nil, after: Date? = nil, before: Date? = nil,
+                      fileType: String? = nil) -> [SearchResult] {
+        // Allow a filter-only search (no keywords) — e.g. "images from ~May".
+        guard !tokens.isEmpty || from != nil || after != nil || before != nil || fileType != nil else {
+            return []
+        }
+        // Post-filter for sources that don't natively take date/type filters:
+        // apply the AI's date range against a row's own timestamp.
+        func dated(_ rows: [SearchResult]) -> [SearchResult] {
+            guard after != nil || before != nil else { return rows }
+            return rows.filter { row in
+                let d = row.modified ?? row.lastUsed ?? row.dateAdded
+                guard let d else { return false }
+                if let after, d < after { return false }
+                if let before, d > before { return false }
+                return true
+            }
+        }
+        // Over-fetch when we'll post-filter, so filtering has candidates to keep.
+        let wide = (after != nil || before != nil || fileType != nil) ? max(limit * 12, 240) : limit
+
         switch source {
         case .messages:
             // MessageStore isn't internally synchronized — it's meant to be
             // touched only from messageQueue. This runs on aiQueue, and the
             // launch-time warm-up loads on messageQueue, so serialize here to
-            // avoid racing that load. Also: the store is lazy, so ensureLoaded()
-            // is required or the first AI message search hits `guard state ==
-            // .ready` and silently returns nothing (the agent then reports it
-            // couldn't find any messages).
+            // avoid racing that load. Sender + date range are hard-filtered
+            // inside the store (handle→contact identity lives there).
             return messageQueue.sync {
                 messageStore.ensureLoaded()
                 contacts.ensureLoaded()
                 guard !messageStore.needsFullDiskAccess else { return [] }
                 let resolver: ((String) -> String?)? = contacts.isReady ? { self.contacts.name(for: $0) } : nil
-                return messageStore.search(tokens: tokens, limit: limit, nameResolver: resolver)
+                return messageStore.search(tokens: tokens, limit: limit,
+                                           sender: from?.searchFolded, after: after, before: before,
+                                           nameResolver: resolver)
                     .map { SearchResult(message: $0, contactName: self.contacts.name(for: $0.conversationHandle)) }
             }
         case .mail:
-            return mailStore.search(tokens: tokens, limit: limit).map { SearchResult(mail: $0) }
+            return Array(dated(mailStore.search(tokens: tokens, limit: wide).map { SearchResult(mail: $0) }).prefix(limit))
         case .notes:
-            return notesStore.search(tokens: tokens, limit: limit).map { SearchResult(note: $0) }
+            return Array(dated(notesStore.search(tokens: tokens, limit: wide).map { SearchResult(note: $0) }).prefix(limit))
         case .calendar:
-            return calendarStore.search(tokens: tokens, limit: limit).map { SearchResult(calendar: $0) }
+            return Array(dated(calendarStore.search(tokens: tokens, limit: wide).map { SearchResult(calendar: $0) }).prefix(limit))
         case .history:
-            return historyStore.search(tokens: tokens, limit: limit).map { SearchResult(history: $0) }
+            return Array(dated(historyStore.search(tokens: tokens, limit: wide).map { SearchResult(history: $0) }).prefix(limit))
         case .clipboard:
-            return ClipboardStore.shared.search(tokens: tokens, limit: limit).map { SearchResult(clip: $0) }
+            return Array(dated(ClipboardStore.shared.search(tokens: tokens, limit: wide).map { SearchResult(clip: $0) }).prefix(limit))
         case .apps:
             return (appStore.search(tokens: tokens, limit: limit) ?? []).map { SearchResult(app: $0) }
         case .folders:
-            return folderStore.search(tokens: tokens, limit: limit).map { SearchResult(folder: $0) }
+            return Array(dated(folderStore.search(tokens: tokens, limit: wide).map { SearchResult(folder: $0) }).prefix(limit))
         case .files:
             // v1: recent files (synchronous). Full Spotlight file search is a
             // follow-up (NSMetadataQuery is async / MDQuery is the sync upgrade).
-            return recentsStore.search(tokens: tokens, limit: limit).map { SearchResult(recent: $0) }
+            let recs = recentsStore.search(tokens: tokens, limit: wide)
+                .filter { Self.matchesFileType($0.contentTypes, kind: $0.kind, path: $0.path, want: fileType) }
+                .map { SearchResult(recent: $0) }
+            return Array(dated(recs).prefix(limit))
+        }
+    }
+
+    /// Whether a file's content types / extension satisfy the AI's requested
+    /// `fileType` (image/pdf/document/audio/video/folder). nil = no constraint.
+    private static func matchesFileType(_ contentTypes: [String], kind: String,
+                                        path: String, want: String?) -> Bool {
+        guard let want = want?.lowercased(), !want.isEmpty else { return true }
+        let cts = contentTypes.map { $0.lowercased() }.joined(separator: " ")
+        let ext = (path as NSString).pathExtension.lowercased()
+        func has(_ needles: [String]) -> Bool { needles.contains { cts.contains($0) } }
+        switch want {
+        case "image", "images", "photo", "photos":
+            return has(["image", "heic", "jpeg", "jpg", "png", "gif"])
+                || ["jpg","jpeg","png","gif","heic","heif","webp","tiff","bmp"].contains(ext)
+        case "pdf":
+            return has(["pdf"]) || ext == "pdf"
+        case "audio", "music":
+            return has(["audio"]) || ["mp3","m4a","wav","aiff","flac","aac"].contains(ext)
+        case "video", "movie", "videos":
+            return has(["movie", "video"]) || ["mp4","mov","m4v","avi","mkv"].contains(ext)
+        case "folder", "folders":
+            return has(["folder"])
+        case "document", "documents", "doc", "docs":
+            return has(["text", "document", "pdf", "spreadsheet", "presentation"])
+                || ["pdf","doc","docx","txt","rtf","pages","key","numbers","md","csv","xlsx","pptx"].contains(ext)
+        default:
+            return true
         }
     }
 

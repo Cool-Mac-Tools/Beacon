@@ -181,6 +181,18 @@ final class AISettings: ObservableObject {
     var apiKey: String? { apiKey(for: provider) }
     var hasKey: Bool { hasKey(for: provider) }
 
+    /// True if ANY provider has a key saved (used to decide whether to nag the
+    /// user to add one at all).
+    var hasAnyKey: Bool { Provider.allCases.contains { hasKey(for: $0) } }
+
+    /// The provider a query should actually run on: the selected one if it has a
+    /// key, otherwise the first provider that does. This means simply viewing a
+    /// keyless provider's tab in Manage never strands a query without a key.
+    var effectiveProvider: Provider {
+        if hasKey(for: provider) { return provider }
+        return Provider.allCases.first { hasKey(for: $0) } ?? provider
+    }
+
     // MARK: - Enabled sources
 
     /// Which sources the AI is allowed to search. Messages and Mail are off by
