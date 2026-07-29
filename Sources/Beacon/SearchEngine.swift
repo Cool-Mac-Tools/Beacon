@@ -565,6 +565,7 @@ final class SearchEngine: ObservableObject {
             fileResults = []
             priorityFolderResults = []
             freshRecentResults = []
+            photoLibraryResults = []
             scannedAppResults = []
             messageResults = []
             noteResults = []
@@ -724,6 +725,11 @@ final class SearchEngine: ObservableObject {
     private var fileResults: [SearchResult] = []
     private var priorityFolderResults: [SearchResult] = []
     private var freshRecentResults: [SearchResult] = []
+    /// Photo-library assets (images/videos) resolved via PhotoKit, kept separate
+    /// from `fileResults` (which the index gather replaces wholesale) and merged
+    /// in at publish time for the Photos/Videos filters.
+    private var photoLibraryResults: [SearchResult] = []
+    private let photoQueue = DispatchQueue(label: "com.beacon.photolibrary", qos: .userInitiated)
     private var scannedAppResults: [SearchResult] = []
     private var messageResults: [SearchResult] = []
     private var noteResults: [SearchResult] = []
@@ -1003,6 +1009,15 @@ final class SearchEngine: ObservableObject {
 
     private func publishPage(_ rows: [SearchResult], preserveCandidates: Bool = false) {
         if aiMode { return }   // AI mode owns `results` via aiPublish only
+        var rows = rows
+        // Merge in Photos-library assets for the Photos/Videos filters (they
+        // live in a package the file index skips). Kept separate so the index
+        // gather — which replaces fileResults wholesale — can't drop them.
+        if !photoLibraryResults.isEmpty,
+           selectedType == .photos || selectedType == .videos {
+            let seen = Set(rows.map(\.path))
+            rows += photoLibraryResults.filter { !seen.contains($0.path) }
+        }
         let scoped = rows.filter { matchesTopLevelType($0, type: selectedType) }
         if !preserveCandidates {
             refinementCandidates = scoped
@@ -1146,6 +1161,7 @@ final class SearchEngine: ObservableObject {
             fileResults = []
             priorityFolderResults = []
             freshRecentResults = []
+            photoLibraryResults = []
             scannedAppResults = []
             messageResults = []
             noteResults = []
@@ -1390,17 +1406,38 @@ final class SearchEngine: ObservableObject {
             // window, hard-filtered by type + date in the query itself.
             let hits = SpotlightFileSearch.search(tokens: tokens, fileType: fileType,
                                                   after: after, before: before, limit: wide)
-            if !hits.isEmpty {
-                let rows = hits.map { hit in
-                    SearchResult(id: hit.path, name: hit.name, path: hit.path,
-                                 kind: hit.kind, size: nil,
-                                 modified: hit.modified, lastUsed: nil, dateAdded: nil,
-                                 isFolder: hit.isFolder, isApp: false,
-                                 contentTypes: hit.contentType.map { [$0] } ?? [],
-                                 matchKind: .name)
-                }
-                return Array(rows.prefix(limit))
+            var rows: [SearchResult] = hits.map { hit in
+                SearchResult(id: hit.path, name: hit.name, path: hit.path,
+                             kind: hit.kind, size: nil,
+                             modified: hit.modified, lastUsed: nil, dateAdded: nil,
+                             isFolder: hit.isFolder, isApp: false,
+                             contentTypes: hit.contentType.map { [$0] } ?? [],
+                             matchKind: .name)
             }
+
+            // Photo library (PhotoKit) — Spotlight doesn't index inside the
+            // .photoslibrary package, so pull image/video assets directly when
+            // the query is media-oriented, and merge by real on-disk path.
+            let ft = fileType?.lowercased() ?? ""
+            let wantImage = ["image", "images", "photo", "photos"].contains(ft)
+            let wantVideo = ["video", "videos", "movie"].contains(ft)
+            if wantImage || wantVideo {
+                var seen = Set(rows.map(\.path))
+                for h in PhotoStore.search(wantImage: wantImage, wantVideo: wantVideo,
+                                           after: after, before: before, limit: wide)
+                where seen.insert(h.url.path).inserted {
+                    rows.append(SearchResult(
+                        id: h.url.path, name: h.name, path: h.url.path,
+                        kind: h.isVideo ? "Video" : "Image", size: nil,
+                        modified: h.creationDate, lastUsed: nil, dateAdded: nil,
+                        isFolder: false, isApp: false,
+                        contentTypes: [h.isVideo ? "public.movie" : "public.image"],
+                        matchKind: .name))
+                }
+                rows.sort { ($0.modified ?? .distantPast) > ($1.modified ?? .distantPast) }
+            }
+
+            if !rows.isEmpty { return Array(rows.prefix(limit)) }
             // Fallback to recent files (e.g. a type-only browse Spotlight declined).
             let recs = recentsStore.search(tokens: tokens, limit: wide)
                 .filter { Self.matchesFileType($0.contentTypes, kind: $0.kind, path: $0.path, want: fileType) }
@@ -1667,7 +1704,7 @@ final class SearchEngine: ObservableObject {
         contentQueryActive = term.count >= contentMinQueryLength
         if scope.searchFiles {
             activeIndexToken = token
-            nameQuery.searchScopes = [NSMetadataQueryLocalComputerScope]
+            nameQuery.searchScopes = indexSearchScopes(for: selectedType)
             nameQuery.sortDescriptors = Self.defaultSortDescriptors
             nameQuery.predicate = namePredicate(
                 tokens: currentTokens, trees: scope.trees,
@@ -1677,7 +1714,7 @@ final class SearchEngine: ObservableObject {
             nameQuery.start()
 
             if contentQueryActive {
-                contentQuery.searchScopes = [NSMetadataQueryLocalComputerScope]
+                contentQuery.searchScopes = indexSearchScopes(for: selectedType)
                 contentQuery.sortDescriptors = Self.defaultSortDescriptors
                 contentQuery.predicate = contentPredicate(
                     tokens: currentTokens, trees: scope.trees,
@@ -1689,6 +1726,7 @@ final class SearchEngine: ObservableObject {
             if selectedType == .all || selectedType == .folders {
                 gatherPriorityFolders(tokens: currentTokens, token: token)
             }
+            gatherPhotoLibrary(type: selectedType, tokens: currentTokens, token: token)
         } else {
             activeIndexToken = 0
             fileResults = []
@@ -1713,6 +1751,51 @@ final class SearchEngine: ObservableObject {
             }
             if allIncludedTypes.contains(.calendar) {
                 gatherCalendarForAll(tokens: currentTokens, token: token)
+            }
+        }
+    }
+
+    /// Scope user-content searches (photos, videos, audio, docs, PDFs) to the
+    /// user's home folder. Searching the whole computer drags in thousands of
+    /// /System framework resources and caches — junk that pollutes results and,
+    /// because the match set balloons, makes the filter laggy. The browse path
+    /// already scopes to home; this keeps typed search consistent and fast.
+    private func indexSearchScopes(for type: FileType) -> [String] {
+        switch type {
+        case .photos, .videos, .audio, .pdfs, .docs, .word, .excel, .powerPoint:
+            return [homePath]
+        default:
+            return [NSMetadataQueryLocalComputerScope]
+        }
+    }
+
+    /// Pull image/video assets from the Photos library (a package the file index
+    /// skips) via PhotoKit, resolve their on-disk originals, and stash them in
+    /// `photoLibraryResults` for publishPage to merge into the Photos/Videos
+    /// filters. Browse (no tokens) → recent assets; typed → filename matches.
+    private func gatherPhotoLibrary(type: FileType, tokens: [String], token: Int) {
+        guard type == .photos || type == .videos else { return }
+        let wantImage = (type == .photos)
+        let wantVideo = (type == .videos)
+        let cap = tokens.isEmpty ? 60 : 40
+        photoQueue.async { [weak self] in
+            guard let self else { return }
+            let rows = PhotoStore.search(wantImage: wantImage, wantVideo: wantVideo,
+                                         after: nil, before: nil, limit: cap, tokens: tokens)
+                .map { h in
+                    SearchResult(id: h.url.path, name: h.name, path: h.url.path,
+                                 kind: h.isVideo ? "Video" : "Image", size: nil,
+                                 modified: h.creationDate, lastUsed: nil,
+                                 dateAdded: h.creationDate,
+                                 isFolder: false, isApp: false,
+                                 contentTypes: [h.isVideo ? "public.movie" : "public.image"],
+                                 matchKind: .name)
+                }
+            DispatchQueue.main.async {
+                guard token == self.searchToken, self.selectedType == type,
+                      !self.aiMode else { return }
+                self.photoLibraryResults = rows
+                self.publish()
             }
         }
     }
@@ -1845,7 +1928,7 @@ final class SearchEngine: ObservableObject {
             return
         }
         activeIndexToken = token
-        nameQuery.searchScopes = [NSMetadataQueryLocalComputerScope]
+        nameQuery.searchScopes = indexSearchScopes(for: type)
         nameQuery.sortDescriptors = Self.defaultSortDescriptors
         nameQuery.predicate = namePredicate(
             tokens: [],
@@ -1856,6 +1939,7 @@ final class SearchEngine: ObservableObject {
         )
         nameQuery.start()
         gatherFreshBrowse(type: type, token: token)
+        gatherPhotoLibrary(type: type, tokens: [], token: token)
     }
 
     private func gatherFreshBrowse(type: FileType, token: Int) {
@@ -2129,6 +2213,7 @@ final class SearchEngine: ObservableObject {
             return result.source == .file && result.isFolder
         case .photos:
             return result.source == .file
+                && isUserFacingDocumentPath(result.path)
                 && (result.contentTypes.contains("public.image")
                 || type.filenameExtensions.contains(ext)
                 )
@@ -2140,16 +2225,19 @@ final class SearchEngine: ObservableObject {
             // still match.
             if ext == "ts" { return false }
             return result.source == .file
+                && isUserFacingDocumentPath(result.path)
                 && (result.contentTypes.contains("public.movie")
                 || type.filenameExtensions.contains(ext)
                 )
         case .audio:
             return result.source == .file
+                && isUserFacingDocumentPath(result.path)
                 && (result.contentTypes.contains("public.audio")
                 || type.filenameExtensions.contains(ext)
                 )
         case .pdfs:
             return result.source == .file
+                && isUserFacingDocumentPath(result.path)
                 && (ext == "pdf" || result.contentTypes.contains("com.adobe.pdf"))
         case .docs:
             return result.source == .file

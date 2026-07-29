@@ -103,6 +103,8 @@ if ! swift build -c release; then
     -framework UniformTypeIdentifiers \
     -framework QuickLook \
     -framework QuickLookThumbnailing \
+    -framework CoreServices \
+    -framework Photos \
     -lsqlite3
 fi
 

@@ -34,6 +34,8 @@
 	<string>Beacon searches event titles, dates, locations, and notes locally on your Mac.</string>
 	<key>NSContactsUsageDescription</key>
 	<string>Beacon uses Contacts to show sender names (instead of phone numbers) in your message search results.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Beacon searches your photo library locally so you can find images and videos by date and type, right from search.</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSSupportsAutomaticTermination</key>

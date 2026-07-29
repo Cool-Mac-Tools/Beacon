@@ -57,6 +57,7 @@ if ! swift build -c "$CONFIG"; then
     -framework QuickLook \
     -framework QuickLookThumbnailing \
     -framework CoreServices \
+    -framework Photos \
     -lsqlite3
 fi
 
