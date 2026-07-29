@@ -212,9 +212,13 @@ Signed with a Developer ID and notarized by Apple — no security warnings.
   last version you'll ever need to download by hand.
 - **Launch at login.** Beacon survives reboots; toggle it from the
   menu-bar menu.
-- **Licensing.** Beacon is \$15/year at https://beaconmac.com — enter your
-  key via the menu-bar icon → Enter License. The source stays public and
-  free to build yourself.
+- **AI mode (new).** Describe what you're looking for in plain language and
+  Beacon returns the actual files, messages, and emails — not a chat reply.
+  Bring your own OpenAI, Claude, or Gemini key. Off by default; opt in from
+  the AI toggle.
+- **Full-disk file search.** Find files from any time, not just recent ones.
+- **Free for now.** Beacon is currently free while we move payments to a new
+  processor. The source stays public and free to build yourself.
 - **Search you can trust.** Folder results refresh mid-session and deleted
   folders stop haunting results; videos found by type are no longer
   dropped (and TypeScript files no longer masquerade as videos); Docs,
