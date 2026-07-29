@@ -57,7 +57,14 @@ final class LicenseStore: ObservableObject {
 
     var licenseKey: String? { defaults.string(forKey: keyDefault) }
 
+    /// Master switch for the paywall. OFF during the Lemon Squeezy → Stripe
+    /// migration so nobody hits a broken license gate; Beacon is free to use
+    /// until the Stripe checkout + license validation is wired back up. Flip to
+    /// true (and restore the checkout links) to re-enable enforcement.
+    static let enforceLicensing = false
+
     var status: Status {
+        if !Self.enforceLicensing { return .licensed }
         // Developer bypass so local dev builds aren't gated. Never set on a
         // shipped install: `defaults write com.beacon.search beacon.dev.bypass -bool YES`.
         if defaults.bool(forKey: "beacon.dev.bypass") { return .licensed }
