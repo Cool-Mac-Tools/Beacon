@@ -1,4 +1,5 @@
 import Foundation
+import ImageIO
 
 /// Drives the AI-mode agentic loop: given a natural-language query, it lets the
 /// model call `search` across the user's enabled Beacon sources, `read_thread`
@@ -23,6 +24,9 @@ enum AIConductor {
     private static let filteredCap = 50
     // Never show a giant wall of results — cap what actually gets published.
     private static let maxPresent = 10
+    // Cap how many image thumbnails go to the model per look_at_images call —
+    // bounds both the payload/latency and the user's token cost.
+    private static let maxVisionImages = 9
 
     // MARK: - Neutral transcript & tool call
 
@@ -32,10 +36,18 @@ enum AIConductor {
         let args: [String: Any]
     }
 
+    /// A base64-encoded image thumbnail for multimodal ("vision") turns.
+    struct AIImage {
+        let mediaType: String   // e.g. "image/jpeg"
+        let base64: String
+    }
+
     private enum Turn {
         case user(String)
         case assistant(text: String?, toolCalls: [ToolCall])
         case toolResults([(call: ToolCall, payload: [String: Any])])
+        /// A user turn carrying images for the model to look at (vision).
+        case userImages(text: String, images: [AIImage])
     }
 
     struct ToolSpec {
@@ -98,6 +110,8 @@ enum AIConductor {
             }
 
             var results: [(call: ToolCall, payload: [String: Any])] = []
+            var visionImages: [AIImage] = []   // images to show the model this round
+            var visionRefs: [Int] = []
             for call in response.toolCalls {
                 let name = call.name
                 let args = call.args
@@ -164,11 +178,34 @@ enum AIConductor {
                     } else {
                         results.append((call, ["error": "read_thread needs the ref of a message result"]))
                     }
+                } else if name == "look_at_images" {
+                    // Vision: render thumbnails of the requested image results and
+                    // hand them to the model to inspect in the next user turn.
+                    let refs = (args["refs"] as? [Any])?.compactMap { intFrom($0) } ?? []
+                    engine.aiSetStatus("Looking at the images…")
+                    var shown: [Int] = []
+                    for ref in refs where ref >= 0 && ref < pool.count {
+                        guard visionImages.count < maxVisionImages else { break }
+                        let row = pool[ref]
+                        guard isImageResult(row), let img = encodeThumbnail(path: row.path) else { continue }
+                        visionImages.append(img)
+                        visionRefs.append(ref)
+                        shown.append(ref)
+                    }
+                    results.append((call, shown.isEmpty
+                        ? ["error": "no readable images among those refs"]
+                        : ["shown": shown, "note": "the \(shown.count) image(s) are in the next message, in ref order"]))
                 } else {
                     results.append((call, ["error": "unknown tool"]))
                 }
             }
             turns.append(.toolResults(results))
+            if !visionImages.isEmpty {
+                let refList = visionRefs.map(String.init).joined(separator: ", ")
+                turns.append(.userImages(
+                    text: "Here are the images for refs [\(refList)], in that order. Look at each and decide which match the request: \"\(query)\". Then call present_results with only the matching ref(s).",
+                    images: visionImages))
+            }
         }
 
         // Ran out of rounds without committing. Rather than dumping the whole
@@ -224,6 +261,13 @@ enum AIConductor {
         when the user clearly means the Mail app (a subject, an email thread, a \
         sender's email). If the user names the source ("in messages", "over \
         text", "in my email"), obey it exactly.
+
+        For VISUAL image queries (find a picture/photo/screenshot/design that \
+        SHOWS something — "a hooded figure on a white background", "a screenshot \
+        of a login screen", "the logo I made"): first search files with \
+        fileType=image (plus any date), then call `look_at_images` with the \
+        candidate refs to actually SEE them, and present the ones that match. A \
+        filename never describes what's in a picture — you must look.
 
         When the item's OWN text won't contain your words — a raw email+password, \
         a login, a verification code, a phone number, an address — do NOT pass \
@@ -301,6 +345,18 @@ enum AIConductor {
                                 "description": "The ref of a message result to read around."],
                     ],
                     "required": ["ref"],
+                ]
+            ),
+            ToolSpec(
+                name: "look_at_images",
+                description: "Actually SEE image results — inspect their pixels to find ones matching a visual description (e.g. \"a hooded figure on a white background\", \"a screenshot of a login screen\"). Pass the refs of candidate images from a files search (fileType=image). The images are shown to you in the next message; then call present_results with the ref(s) that match. Filenames don't describe what's in a picture, so you MUST look for any visual query.",
+                parameters: [
+                    "type": "object",
+                    "properties": [
+                        "refs": ["type": "array", "items": ["type": "integer"],
+                                 "description": "Refs of candidate image results to look at (a handful, most-likely first)."],
+                    ],
+                    "required": ["refs"],
                 ]
             ),
             ToolSpec(
@@ -397,6 +453,34 @@ enum AIConductor {
         return String(flat.prefix(160))
     }
 
+    // MARK: - Vision helpers
+
+    private static func isImageResult(_ r: SearchResult) -> Bool {
+        guard r.source == .file, !r.path.isEmpty else { return false }
+        if r.contentTypes.contains(where: { $0.contains("image") }) { return true }
+        let ext = (r.path as NSString).pathExtension.lowercased()
+        return ["jpg","jpeg","png","gif","heic","heif","webp","tiff","bmp","psd"].contains(ext)
+    }
+
+    /// Decode a downscaled JPEG thumbnail of an image file and base64-encode it.
+    /// ImageIO does the downscale during decode, so this stays cheap even for
+    /// large originals, and the small payload keeps vision token cost down.
+    private static func encodeThumbnail(path: String, maxPixel: Int = 768) -> AIImage? {
+        let url = URL(fileURLWithPath: path) as CFURL
+        guard let src = CGImageSourceCreateWithURL(url, nil) else { return nil }
+        let opts: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixel,
+        ]
+        guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else { return nil }
+        let data = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(data, "public.jpeg" as CFString, 1, nil) else { return nil }
+        CGImageDestinationAddImage(dest, cg, [kCGImageDestinationLossyCompressionQuality: 0.7] as CFDictionary)
+        guard CGImageDestinationFinalize(dest) else { return nil }
+        return AIImage(mediaType: "image/jpeg", base64: (data as Data).base64EncodedString())
+    }
+
     // MARK: - Provider dispatch
 
     private struct Reply {
@@ -468,6 +552,13 @@ enum AIConductor {
                     }
                 }
                 messages.append(msg)
+            case .userImages(let text, let images):
+                var content: [[String: Any]] = [["type": "text", "text": text]]
+                for img in images {
+                    content.append(["type": "image_url",
+                                    "image_url": ["url": "data:\(img.mediaType);base64,\(img.base64)"]])
+                }
+                messages.append(["role": "user", "content": content])
             case .toolResults(let results):
                 for r in results {
                     messages.append(["role": "tool", "tool_call_id": r.call.id,
@@ -519,6 +610,13 @@ enum AIConductor {
                     content.append(["type": "tool_use", "id": c.id, "name": c.name, "input": c.args])
                 }
                 messages.append(["role": "assistant", "content": content])
+            case .userImages(let text, let images):
+                var content: [[String: Any]] = [["type": "text", "text": text]]
+                for img in images {
+                    content.append(["type": "image",
+                                    "source": ["type": "base64", "media_type": img.mediaType, "data": img.base64]])
+                }
+                messages.append(["role": "user", "content": content])
             case .toolResults(let results):
                 let content = results.map { r -> [String: Any] in
                     ["type": "tool_result", "tool_use_id": r.call.id, "content": jsonString(r.payload)]
@@ -576,6 +674,12 @@ enum AIConductor {
                     parts.append(["functionCall": ["name": c.name, "args": c.args]])
                 }
                 contents.append(["role": "model", "parts": parts])
+            case .userImages(let text, let images):
+                var parts: [[String: Any]] = [["text": text]]
+                for img in images {
+                    parts.append(["inlineData": ["mimeType": img.mediaType, "data": img.base64]])
+                }
+                contents.append(["role": "user", "parts": parts])
             case .toolResults(let results):
                 let parts = results.map { r -> [String: Any] in
                     ["functionResponse": ["name": r.call.name, "response": r.payload]]

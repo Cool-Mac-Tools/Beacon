@@ -105,6 +105,7 @@ if ! swift build -c release; then
     -framework QuickLookThumbnailing \
     -framework CoreServices \
     -framework Photos \
+    -framework ImageIO \
     -lsqlite3
 fi
 
