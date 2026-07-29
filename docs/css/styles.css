@@ -471,10 +471,7 @@ body.menu-open { overflow: hidden; }
   min-height: 590px;
   padding: 64px clamp(38px, 6vw, 92px);
   text-align: left;
-  background:
-    radial-gradient(circle at 18% 20%, rgba(255, 190, 105, 0.22), transparent 30%),
-    radial-gradient(circle at 82% 78%, rgba(96, 120, 255, 0.18), transparent 34%),
-    #f5f5f7;
+  background: #f5f5f7;
 }
 
 .tile-feature-copy {
@@ -874,6 +871,9 @@ body.menu-open { overflow: hidden; }
 }
 
 .showcase-card .product-shot {
+  display: block;
+  width: min(760px, 100%);
+  margin-inline: auto;
   border-radius: 18px;
   box-shadow: 0 24px 70px rgba(0, 0, 0, 0.16);
 }
