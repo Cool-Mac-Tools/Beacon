@@ -25,15 +25,28 @@
     .hint { color: #6e6e73; font-size: 14px; margin-top: 18px; line-height: 1.5; }
     .error { color: #c33; }
   </style>
+  <meta name="robots" content="noindex, follow">
+  <link rel="canonical" href="https://beaconmac.com/beacon/thanks.html">
+  <meta name="theme-color" content="#ffffff">
 </head>
 <body>
   <div class="thanks-wrap">
     <h1>Thanks for buying Beacon!</h1>
-    <p>Your license key is on your purchase confirmation and in your
-      receipt email (subject “Your Beacon license key”).</p>
+
+    <!-- Filled in by the claim flow below. Hidden until we have a key. -->
+    <p id="key-intro" hidden>Here’s your license key — it’s also in your
+      receipt email:</p>
+    <div class="license-box" id="key-box" hidden></div>
+    <p id="key-actions" hidden>
+      <button class="copy-btn" id="copy-btn" type="button">Copy key</button>
+    </p>
+
+    <!-- Fallback / loading message. -->
+    <p id="status-msg">Confirming your purchase…</p>
+
     <p style="margin-top: 26px">
       <a class="copy-btn" style="text-decoration:none"
-         href="https://github.com/claytonwendelwon/Mac-search/releases/latest">
+         href="https://github.com/Cool-Mac-Tools/Beacon/releases/latest">
         Download Beacon.dmg ↓
       </a>
     </p>
@@ -44,5 +57,45 @@
       recover it from your purchase email.
     </p>
   </div>
+
+  <script>
+    // Stripe appends ?session_id=cs_... to the success URL. Exchange it for a
+    // license key at the Worker (idempotent — safe to reload this page). If the
+    // param is absent or the claim fails, fall back to the receipt-email message
+    // so the buyer is never stranded.
+    (function () {
+      var sessionId = new URLSearchParams(location.search).get("session_id");
+      var status = document.getElementById("status-msg");
+      var emailFallback =
+        "Your license key is in your receipt email (subject “Your Beacon " +
+        "license key”). Enter it in Beacon to activate.";
+
+      if (!sessionId) { status.textContent = emailFallback; return; }
+
+      fetch("https://license.beaconmac.com/claim", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId: sessionId })
+      })
+        .then(function (r) { return r.json().catch(function () { return {}; }); })
+        .then(function (data) {
+          if (!data || !data.key) { status.textContent = emailFallback; return; }
+          document.getElementById("key-intro").hidden = false;
+          var box = document.getElementById("key-box");
+          box.textContent = data.key;
+          box.hidden = false;
+          document.getElementById("key-actions").hidden = false;
+          status.hidden = true;
+          var btn = document.getElementById("copy-btn");
+          btn.addEventListener("click", function () {
+            navigator.clipboard.writeText(data.key).then(function () {
+              btn.textContent = "Copied ✓";
+              setTimeout(function () { btn.textContent = "Copy key"; }, 2000);
+            });
+          });
+        })
+        .catch(function () { status.textContent = emailFallback; });
+    })();
+  </script>
 </body>
 </html>
