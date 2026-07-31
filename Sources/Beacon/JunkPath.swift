@@ -40,4 +40,30 @@ enum JunkPath {
     static func isProjectRoot(_ dirPath: String, _ fm: FileManager = .default) -> Bool {
         fm.fileExists(atPath: dirPath + "/.git")
     }
+
+    /// The root paths — each with a trailing "/" for prefix matching — of code
+    /// repositories under `home`. A shallow, bounded scan for `.git`: covers
+    /// repos that sit directly in home (the common case) and one level of
+    /// grouping folder (~/dev/foo, ~/Projects/bar) without walking a large home
+    /// tree. The Spotlight-backed views prefix-check results against this to
+    /// keep project files out of everything except the Developer pill.
+    static func projectRoots(under home: String, maxDepth: Int = 2,
+                             _ fm: FileManager = .default) -> [String] {
+        var roots: [String] = []
+        func scan(_ dir: String, _ depth: Int) {
+            guard let entries = try? fm.contentsOfDirectory(atPath: dir) else { return }
+            if entries.contains(".git") { roots.append(dir + "/"); return } // a repo — don't descend
+            guard depth < maxDepth else { return }
+            for name in entries where !name.hasPrefix(".") && !components.contains(name) {
+                if depth == 0, name == "Library" || name == "Applications" { continue }
+                let child = dir + "/" + name
+                var isDir: ObjCBool = false
+                if fm.fileExists(atPath: child, isDirectory: &isDir), isDir.boolValue {
+                    scan(child, depth + 1)
+                }
+            }
+        }
+        scan(home, 0)
+        return roots
+    }
 }

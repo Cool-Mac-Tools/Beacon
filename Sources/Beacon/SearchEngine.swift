@@ -672,6 +672,13 @@ final class SearchEngine: ObservableObject {
     private let historyStore = BrowserHistoryStore()
     private let recentsStore = RecentsStore()
     private let folderStore = FolderStore()
+
+    /// Cached code-repository roots under home (trailing "/"), refreshed at most
+    /// once a minute. Every file-index view except the Developer pill excludes
+    /// paths under these so a dev's project files don't bury real documents.
+    private let projectRootsLock = NSLock()
+    private var projectRootPrefixes: [String] = []
+    private var projectRootsComputedAt = Date.distantPast
     private let appStore = AppStore()
     private let boundedMetadataStore = BoundedMetadataStore()
     private let settingsStore = SettingsStore()
@@ -2279,6 +2286,19 @@ final class SearchEngine: ObservableObject {
         return !JunkPath.contains(path)
     }
 
+    /// Repo roots under home, recomputed at most once a minute. Fetched ONCE per
+    /// readResults call (not per row) so the lock and the bounded `.git` scan
+    /// stay off the per-result hot path.
+    private func currentProjectRootPrefixes() -> [String] {
+        projectRootsLock.lock()
+        defer { projectRootsLock.unlock() }
+        if Date().timeIntervalSince(projectRootsComputedAt) > 60 {
+            projectRootPrefixes = JunkPath.projectRoots(under: homePath)
+            projectRootsComputedAt = Date()
+        }
+        return projectRootPrefixes
+    }
+
     private func enabledDocumentExtensions() -> Set<String> {
         let optionIDs = RefinementLayoutStore.shared.layout(for: .docs)
             .optionIDs["format"] ?? []
@@ -3323,12 +3343,17 @@ final class SearchEngine: ObservableObject {
         // them entirely — that was the visible first-load lag on Photos.
         let wantsMetadataFacets = !refinementSelection.isEmpty
             || selectedType == .audio
+        // Keep code-repository files out of every file-index view EXCEPT the
+        // Developer pill — they're project noise in Recents/Docs/etc. Fetched
+        // once here (not per row); empty for .developer so that pill keeps them.
+        let projectPrefixes = selectedType == .developer ? [] : currentProjectRootPrefixes()
         var added = 0
         for index in 0..<count {
             guard let item = query.result(at: index) as? NSMetadataItem else { continue }
             guard let path = item.value(forAttribute: NSMetadataItemPathKey) as? String else { continue }
             if merged[path] != nil { continue } // keep the higher-priority (name) match
             if isBrowsing, !isUserFacingRecentPath(path) { continue }
+            if !projectPrefixes.isEmpty, projectPrefixes.contains(where: path.hasPrefix) { continue }
 
             let name = (item.value(forAttribute: NSMetadataItemDisplayNameKey) as? String)
                 ?? (item.value(forAttribute: NSMetadataItemFSNameKey) as? String)

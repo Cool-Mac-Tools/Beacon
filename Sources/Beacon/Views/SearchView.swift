@@ -1046,7 +1046,7 @@ struct SearchView: View {
                     }
                     .padding(.vertical, 2)
                 }
-                .frame(height: min(CGFloat(filterLayout.hiddenFilters.count) * 34, 240))
+                .frame(height: min(CGFloat(filterLayout.hiddenFilters.count) * 34, 400))
             }
             Divider()
             Button("Restore Defaults") {
