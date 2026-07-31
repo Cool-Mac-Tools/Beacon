@@ -36,6 +36,22 @@ if [ -z "$VERSION" ] || [ "$VERSION" = "--publish" ]; then
   VERSION="$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' Resources/Info.plist 2>/dev/null || echo "0.1.0")"
 fi
 
+# --- License-enforcement preflight -----------------------------------------
+# Surface the enforcement state so a signed build never ships with the wrong
+# one by accident (free vs. paywalled), and flag the dev-bypass foot-gun: if
+# THIS Mac has beacon.dev.bypass set, the shipped binary is still correct, but
+# you can't verify the gate here — every build runs unlocked locally.
+ENFORCE="$(grep -oE 'enforceLicensing = (true|false)' Sources/Beacon/LicenseStore.swift \
+  | awk '{print $NF}' | head -1)"
+echo "==> License enforcement: enforceLicensing = ${ENFORCE:-unknown}"
+if [ "$(defaults read com.beacon.search beacon.dev.bypass 2>/dev/null)" = "1" ] \
+   && [ "$ENFORCE" = "true" ]; then
+  echo "    WARNING: beacon.dev.bypass is set on this Mac. The shipped binary is"
+  echo "    fine, but you can't verify the license gate here (every build runs"
+  echo "    unlocked locally). To test enforcement:"
+  echo "        defaults delete com.beacon.search beacon.dev.bypass"
+fi
+
 BUILD_DIR="$ROOT/.build/release"
 APP_BUNDLE="$ROOT/$APP_NAME.app"
 DIST_DIR="$ROOT/dist"

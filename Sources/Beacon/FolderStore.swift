@@ -186,10 +186,6 @@ final class FolderStore {
 
     private func shouldSkip(url: URL, isPackage: Bool) -> Bool {
         if isPackage { return true }
-        let excluded = Set([
-            "node_modules", "DerivedData", "Caches", "__pycache__",
-            ".build", ".git", ".Trash"
-        ])
-        return excluded.contains(url.lastPathComponent)
+        return JunkPath.components.contains(url.lastPathComponent)
     }
 }

@@ -1027,6 +1027,7 @@ final class SearchEngine: ObservableObject {
             RefinementMatcher.matches($0, type: selectedType,
                                       selection: refinementSelection)
         }
+        Log.debug("publishPage type=\(selectedType) in=\(rows.count) scoped=\(scoped.count) refined=\(refined.count) contentSel=\(refinementSelection.optionID(for: "content") ?? "none")")
         let page: (rows: [SearchResult], hasMore: Bool)
         if currentTokens.isEmpty {
             page = PageWindow.slice(sortedForDisplay(refined), limit: pageLimit)
@@ -2267,12 +2268,7 @@ final class SearchEngine: ObservableObject {
         if excludedRoots.contains(where: path.hasPrefix) {
             return false
         }
-        let excludedComponents = [
-            "/.git/", "/node_modules/", "/.build/", "/DerivedData/",
-            "/Caches/", "/__pycache__/", "/.Trash/", "/.npm/",
-            "/.cargo/", "/.rustup/", ".app/Contents/"
-        ]
-        return !excludedComponents.contains(where: path.contains)
+        return !JunkPath.contains(path)
     }
 
     private func enabledDocumentExtensions() -> Set<String> {
@@ -3051,6 +3047,24 @@ final class SearchEngine: ObservableObject {
 
     private func refinementMetadataPredicates() -> [NSPredicate] {
         var predicates: [NSPredicate] = []
+
+        // Keep build artifacts, package caches, and VCS internals out of the
+        // Spotlight gather for every file-type chip — not just Docs. Media
+        // chips (Photos/Videos/Audio/PDFs) previously relied on client-side
+        // filtering *after* the page cap, so on a developer machine a page
+        // could fill with node_modules PNGs and then get filtered down to a
+        // handful of real photos. Excluding at query time keeps pages full.
+        let junkFilteredTypes: Set<FileType> = [.docs, .photos, .videos, .audio, .pdfs]
+        if junkFilteredTypes.contains(selectedType) {
+            for fragment in JunkPath.pathFragments {
+                predicates.append(NSCompoundPredicate(
+                    notPredicateWithSubpredicate: NSPredicate(
+                        format: "kMDItemPath CONTAINS[cd] %@", fragment
+                    )
+                ))
+            }
+        }
+
         if selectedType == .docs {
             let homeLibrary = NSHomeDirectory() + "/Library/"
             predicates.append(NSCompoundPredicate(orPredicateWithSubpredicates: [
@@ -3072,17 +3086,6 @@ final class SearchEngine: ObservableObject {
                 predicates.append(NSCompoundPredicate(
                     notPredicateWithSubpredicate: NSPredicate(
                         format: "kMDItemPath BEGINSWITH[cd] %@", path
-                    )
-                ))
-            }
-            for component in [
-                "/node_modules/", "/.git/", "/.build/", "/DerivedData/",
-                "/Caches/", "/__pycache__/", "/.Trash/", "/.npm/",
-                "/.cargo/", "/.rustup/", ".app/Contents/"
-            ] {
-                predicates.append(NSCompoundPredicate(
-                    notPredicateWithSubpredicate: NSPredicate(
-                        format: "kMDItemPath CONTAINS[cd] %@", component
                     )
                 ))
             }
@@ -3424,9 +3427,7 @@ final class SearchEngine: ObservableObject {
            !path.hasPrefix(homePath + "/Library/CloudStorage/") {
             return false
         }
-        let excluded = ["/.git/", "/node_modules/", "/.build/", "/DerivedData/",
-                        "/Caches/", "/__pycache__/"]
-        return !excluded.contains(where: path.contains)
+        return !JunkPath.contains(path)
     }
 
     private func isIncludedInAll(_ result: SearchResult) -> Bool {

@@ -141,7 +141,7 @@ final class RecentsStore {
         cacheLock.unlock()
         let results = Array(matches.prefix(limit))
 
-        Log.write("RecentsStore: scanned=\(visited) roots=\(scanRoots.count) matched=\(out.count) returned=\(results.count) tokens=\(tokens)")
+        Log.debug("RecentsStore: scanned=\(visited) roots=\(scanRoots.count) matched=\(out.count) returned=\(results.count) tokens=\(tokens)")
         return results
     }
 

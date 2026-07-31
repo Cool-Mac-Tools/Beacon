@@ -129,9 +129,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let alert = NSAlert()
         alert.messageText = "Enter your Beacon license key"
         alert.informativeText = "Your key is on your purchase confirmation and "
-            + "in your receipt email from Lemon Squeezy."
+            + "in your receipt email."
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
-        field.placeholderString = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+        field.placeholderString = "BEACON-XXXXX-XXXXX-XXXXX"
         alert.accessoryView = field
         alert.addButton(withTitle: "Activate")
         alert.addButton(withTitle: "Cancel")

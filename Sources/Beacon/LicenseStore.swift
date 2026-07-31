@@ -15,10 +15,14 @@ final class LicenseStore: ObservableObject {
         string: "https://license.beaconmac.com/validate"
     )!
 
-    /// Lemon Squeezy checkout (also starts the 7-day free trial). Same URL the
-    /// website's Buy buttons use.
+    /// Checkout / start-trial URL — same one the website's Buy buttons use.
+    /// TODO(stripe): swap in the Stripe Payment Link once it's created (success
+    /// URL → beaconmac.com/beacon/thanks.html?session_id={CHECKOUT_SESSION_ID}).
+    /// Until then this points at the product page (a safe destination if the
+    /// license gate is ever re-enabled before the link exists), NOT the defunct
+    /// Lemon Squeezy checkout.
     static let checkoutURL = URL(
-        string: "https://beaconmac.lemonsqueezy.com/checkout/buy/636f0d26-1b9b-4ca4-8434-4476b0f132fe"
+        string: "https://beaconmac.com/beacon/"
     )!
 
     enum Status: Equatable {

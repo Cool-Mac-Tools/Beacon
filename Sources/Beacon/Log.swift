@@ -43,11 +43,26 @@ enum Log {
         return handle
     }()
 
+    /// Verbose logging is opt-in via `defaults write com.beacon.search
+    /// beacon.debug.logging -bool YES`. It stays OFF in shipped builds so we
+    /// don't write the user's search terms and AI prompts to a plaintext file
+    /// on every keystroke. Read once at launch — a debug switch doesn't need to
+    /// react mid-session, and this keeps `debug` free on the hot path.
+    static let verbose = UserDefaults.standard.bool(forKey: "beacon.debug.logging")
+
     static func write(_ message: String) {
         queue.async {
             let line = "[\(formatter.string(from: Date()))] \(message)\n"
             guard let data = line.data(using: .utf8) else { return }
             try? handle?.write(contentsOf: data)
         }
+    }
+
+    /// Chatty, per-keystroke, or query-term-bearing diagnostics. No-ops (and
+    /// never builds the string) unless verbose logging is enabled. Use this for
+    /// anything that fires on the search hot path or embeds user content.
+    static func debug(_ message: @autoclosure () -> String) {
+        guard verbose else { return }
+        write(message())
     }
 }

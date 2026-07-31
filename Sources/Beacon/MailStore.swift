@@ -211,7 +211,7 @@ final class MailStore {
         lastTokens = tokens
         lastMatches = matches
         lastSearchWasGmailOnly = gmailOnly
-        Log.write("MailStore: tokens=\(tokens) matched=\(matches.count)")
+        Log.debug("MailStore: tokens=\(tokens) matched=\(matches.count)")
         return Array(matches.prefix(limit))
     }
 

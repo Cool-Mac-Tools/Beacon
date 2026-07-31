@@ -97,15 +97,16 @@ enum AIConductor {
             guard let response = chat(provider: provider, key: key, model: model,
                                       system: system, tools: tools, turns: turns) else {
                 engine.aiSetStatus("Couldn't reach \(provider.displayName). Check your key and connection.")
-                engine.aiPublish(pool)   // show anything found so far
+                engine.aiPublish(Array(pool.prefix(maxPresent)))   // a few candidates, never the full pool
                 return
             }
             turns.append(.assistant(text: response.text, toolCalls: response.toolCalls))
 
             guard !response.toolCalls.isEmpty else {
-                // No tool call — nothing more to do. Fall back to whatever it
-                // surfaced so the user still gets locations.
-                engine.aiPublish(pool)
+                // No tool call — nothing more to do. Fall back to a few of
+                // what it surfaced (capped, never the full unranked pool) so
+                // the user still gets locations.
+                engine.aiPublish(Array(pool.prefix(maxPresent)))
                 return
             }
 
@@ -115,14 +116,17 @@ enum AIConductor {
             for call in response.toolCalls {
                 let name = call.name
                 let args = call.args
+                Log.debug("AI[round \(round)] tool=\(name)")
 
                 if name == "present_results" {
                     let refs = (args["refs"] as? [Any])?.compactMap { intFrom($0) } ?? []
                     let chosen = refs.compactMap { $0 >= 0 && $0 < pool.count ? pool[$0] : nil }
+                    Log.debug("AI present_results refs=\(refs.count) resolved=\(chosen.count)")
                     engine.aiSetStatus("")
-                    // Honor the model's ranking (best first); cap the count so a
-                    // sloppy "present everything" can't wall the user.
-                    engine.aiPublish(Array((chosen.isEmpty ? pool : chosen).prefix(maxPresent)))
+                    // Publish exactly what the model chose (capped). An explicit
+                    // empty selection means "nothing matched" — show nothing,
+                    // never fall back to dumping the whole candidate pool.
+                    engine.aiPublish(Array(chosen.prefix(maxPresent)))
                     return
                 }
 
@@ -192,6 +196,7 @@ enum AIConductor {
                         visionRefs.append(ref)
                         shown.append(ref)
                     }
+                    Log.debug("AI look_at_images requested=\(refs.count) shown=\(shown.count)")
                     results.append((call, shown.isEmpty
                         ? ["error": "no readable images among those refs"]
                         : ["shown": shown, "note": "the \(shown.count) image(s) are in the next message, in ref order"]))
@@ -262,12 +267,16 @@ enum AIConductor {
         sender's email). If the user names the source ("in messages", "over \
         text", "in my email"), obey it exactly.
 
-        For VISUAL image queries (find a picture/photo/screenshot/design that \
-        SHOWS something — "a hooded figure on a white background", "a screenshot \
-        of a login screen", "the logo I made"): first search files with \
-        fileType=image (plus any date), then call `look_at_images` with the \
-        candidate refs to actually SEE them, and present the ones that match. A \
-        filename never describes what's in a picture — you must look.
+        VISUAL IMAGE QUERIES — this is a hard rule. If the user wants an image by \
+        what it SHOWS (a hooded figure, a screenshot of X, a receipt, a person or \
+        scene): (1) search files with fileType=image plus any date/folder hint to \
+        narrow the candidates; (2) you MUST then call `look_at_images` on those \
+        refs and inspect the actual pixels; (3) present ONLY the refs whose pixels \
+        match the description. NEVER call present_results with image results you \
+        have not looked at — returning unviewed images is a failure. If, after \
+        looking, none match, present an EMPTY list rather than guessing. Only the \
+        images your search returns are candidates, so if the picture may be old, \
+        include a rough date to bring it into range.
 
         When the item's OWN text won't contain your words — a raw email+password, \
         a login, a verification code, a phone number, an address — do NOT pass \
@@ -512,14 +521,32 @@ enum AIConductor {
 
     /// Fire the request synchronously (we're already off the main thread on
     /// aiQueue) and decode the JSON body.
+    ///
+    /// Retries once, but only on a transport-level failure where the server
+    /// replied with nothing (a dropped connection, DNS hiccup, TLS reset). We
+    /// deliberately do NOT retry on our own 65s wait timing out — by then the
+    /// request may have reached the model, and re-sending would double-charge
+    /// the user's tokens.
     private static func send(_ request: URLRequest) -> [String: Any]? {
-        let sem = DispatchSemaphore(value: 0)
-        var out: Data?
-        URLSession.shared.dataTask(with: request) { d, _, _ in out = d; sem.signal() }.resume()
-        _ = sem.wait(timeout: .now() + 65)
-        guard let out,
-              let json = try? JSONSerialization.jsonObject(with: out) as? [String: Any] else { return nil }
-        return json
+        for attempt in 0..<2 {
+            let sem = DispatchSemaphore(value: 0)
+            var out: Data?
+            var transportFailed = false
+            URLSession.shared.dataTask(with: request) { d, _, error in
+                out = d
+                transportFailed = (error != nil)
+                sem.signal()
+            }.resume()
+            guard sem.wait(timeout: .now() + 65) == .success else { return nil }
+            if let out,
+               let json = try? JSONSerialization.jsonObject(with: out) as? [String: Any] {
+                return json
+            }
+            // No usable body. Retry once only if the server never answered.
+            if transportFailed, attempt == 0 { continue }
+            return nil
+        }
+        return nil
     }
 
     private static func post(_ url: URL, headers: [String: String], body: [String: Any]) -> URLRequest? {

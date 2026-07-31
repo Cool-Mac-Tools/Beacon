@@ -175,11 +175,15 @@ final class MessageStore {
 
             if let sender {
                 if rec.isFromMe { continue }   // "from X" = authored by X, not by me
-                let match = (senderName?.contains(sender) ?? false)
-                    || (peerName?.contains(sender) ?? false)
+                // Match resolved names as whole words so "from Sam" doesn't pull
+                // in every Samantha and Samuel. Raw handles stay substring —
+                // there "from 5551234" is meant to match a fragment of a longer
+                // phone number or the local-part of an email address.
+                let match = (senderName.map { SearchText.hasWholePhrase($0, sender) } ?? false)
+                    || (peerName.map { SearchText.hasWholePhrase($0, sender) } ?? false)
+                    || SearchText.hasWholePhrase(rec.chatName.searchFolded, sender)
                     || rec.handle.searchFolded.contains(sender)
                     || rec.conversationHandle.searchFolded.contains(sender)
-                    || rec.chatName.searchFolded.contains(sender)
                 if !match { continue }
             }
 
@@ -217,7 +221,7 @@ final class MessageStore {
             lastSearchUsedResolver = nameResolver != nil
         }
         let results = Array(matches.prefix(limit))
-        Log.write("MessageStore: search tokens=\(tokens) sender=\(sender ?? "-") range=\(after != nil || before != nil) cache=\(cache.count) matched=\(out.count) returned=\(results.count)")
+        Log.debug("MessageStore: search tokens=\(tokens) sender=\(sender ?? "-") range=\(after != nil || before != nil) cache=\(cache.count) matched=\(out.count) returned=\(results.count)")
         return results
     }
 

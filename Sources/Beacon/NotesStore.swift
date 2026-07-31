@@ -91,7 +91,7 @@ final class NotesStore {
         lastSearchTokens = tokens
         lastSearchMatches = matches
         let results = Array(matches.prefix(limit))
-        Log.write("NotesStore: search tokens=\(tokens) cache=\(cache.count) matched=\(out.count) returned=\(results.count)")
+        Log.debug("NotesStore: search tokens=\(tokens) cache=\(cache.count) matched=\(out.count) returned=\(results.count)")
         return results
     }
 

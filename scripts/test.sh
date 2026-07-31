@@ -18,6 +18,7 @@ xcrun swiftc -swift-version 5 \
   Sources/Beacon/SearchState.swift \
   Sources/Beacon/Log.swift \
   Sources/Beacon/AppStore.swift \
+  Sources/Beacon/JunkPath.swift \
   Sources/Beacon/FolderStore.swift \
   Tests/FallbackSearchReliability.swift \
   -o "$TEST_BUILD_DIR/SearchReliabilityTests"
