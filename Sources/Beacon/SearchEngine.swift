@@ -2244,6 +2244,14 @@ final class SearchEngine: ObservableObject {
             return result.source == .file
                 && isUserFacingDocumentPath(result.path)
                 && enabledDocumentExtensions().contains(ext)
+        case .developer:
+            // Source/code files, wherever they live — including the repo trees
+            // pruned from Recents. isUserFacingDocumentPath still drops build
+            // junk (node_modules/.build/DerivedData) and system paths.
+            return result.source == .file
+                && isUserFacingDocumentPath(result.path)
+                && (result.contentTypes.contains("public.source-code")
+                    || type.filenameExtensions.contains(ext))
         case .word, .excel, .powerPoint:
             return result.source == .file
                 && (type.filenameExtensions.contains(ext)
@@ -3054,7 +3062,7 @@ final class SearchEngine: ObservableObject {
         // filtering *after* the page cap, so on a developer machine a page
         // could fill with node_modules PNGs and then get filtered down to a
         // handful of real photos. Excluding at query time keeps pages full.
-        let junkFilteredTypes: Set<FileType> = [.docs, .photos, .videos, .audio, .pdfs]
+        let junkFilteredTypes: Set<FileType> = [.docs, .photos, .videos, .audio, .pdfs, .developer]
         if junkFilteredTypes.contains(selectedType) {
             for fragment in JunkPath.pathFragments {
                 predicates.append(NSCompoundPredicate(

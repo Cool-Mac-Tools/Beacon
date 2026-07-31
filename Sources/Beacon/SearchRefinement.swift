@@ -216,6 +216,8 @@ enum RefinementCatalog {
             return [calendarWindow(), calendarName(), temporalDirection()]
         case .pdfs:
             return [documentLocation(), modifiedDate()]
+        case .developer:
+            return [documentLocation(), modifiedDate()]
         case .photos:
             return [photoSource(), photoDate(), format(
                 [.init("png", "PNG"), .init("jpeg", "JPEG"), .init("heic", "HEIC"),

@@ -28,6 +28,7 @@ enum FileType: String, CaseIterable, Identifiable {
     case videos
     case clipboard
     case settings
+    case developer
 
     var id: String { rawValue }
 
@@ -74,7 +75,9 @@ enum FileType: String, CaseIterable, Identifiable {
         switch self {
         // Gmail is already represented by Mail in All; its dedicated chip is
         // a provider-scoped convenience and must not duplicate those rows.
-        case .all, .recents, .clipboard, .history, .settings, .gmail: return false
+        // Developer is an opt-in code search — it must NOT blend source files
+        // back into the everyday All view we just cleared them out of.
+        case .all, .recents, .clipboard, .history, .settings, .gmail, .developer: return false
         default: return true
         }
     }
@@ -113,6 +116,7 @@ enum FileType: String, CaseIterable, Identifiable {
         case .clipboard: return "Clipboard"
         case .history: return "History"
         case .settings: return "Settings"
+        case .developer: return "Developer"
         }
     }
 
@@ -143,6 +147,7 @@ enum FileType: String, CaseIterable, Identifiable {
         case .clipboard: return "doc.on.clipboard"
         case .history: return "clock.arrow.circlepath"
         case .settings: return "gearshape"
+        case .developer: return "chevron.left.forwardslash.chevron.right"
         }
     }
 
@@ -199,6 +204,11 @@ enum FileType: String, CaseIterable, Identifiable {
             return ["public.audio"]
         case .folders:
             return ["public.folder"]
+        case .developer:
+            // Spotlight tags most recognized languages as public.source-code;
+            // web/config files (html/css/json/yaml…) aren't, so the extension
+            // list below supplements this.
+            return ["public.source-code"]
         }
     }
 
@@ -237,6 +247,24 @@ enum FileType: String, CaseIterable, Identifiable {
                 "mts", "m2ts", "3gp", "3g2", "ogv", "dv", "vob", "qt",
                 "wmv", "flv", "divx", "asf", "mxf"
             ]
+        case .developer:
+            return [
+                // Compiled / systems
+                "swift", "h", "hpp", "m", "mm", "c", "cc", "cpp", "cxx",
+                "rs", "go", "java", "kt", "kts", "scala", "cs", "dart",
+                "zig", "nim", "v",
+                // Scripting
+                "js", "mjs", "cjs", "jsx", "ts", "tsx", "py", "rb", "php",
+                "pl", "pm", "lua", "r", "sh", "bash", "zsh", "fish", "ps1",
+                "ex", "exs", "erl", "hs", "clj", "cljs", "jl", "el", "sql",
+                // Web / markup / style
+                "html", "htm", "css", "scss", "sass", "less", "styl",
+                "vue", "svelte", "astro",
+                // Config / data / IaC
+                "json", "jsonc", "json5", "yaml", "yml", "toml", "xml",
+                "gradle", "groovy", "proto", "graphql", "gql", "tf", "hcl",
+                "ipynb"
+            ]
         default:
             return []
         }
@@ -246,7 +274,7 @@ enum FileType: String, CaseIterable, Identifiable {
     var isOptionalSource: Bool {
         switch self {
         case .word, .excel, .powerPoint, .mail, .gmail, .calendar,
-             .googleDrive, .oneDrive, .dropbox, .iCloudDrive: return true
+             .googleDrive, .oneDrive, .dropbox, .iCloudDrive, .developer: return true
         default: return false
         }
     }
