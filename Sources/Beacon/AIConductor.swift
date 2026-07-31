@@ -413,10 +413,37 @@ enum AIConductor {
     /// 23:59:59 so a `before` bound includes the whole day.
     private static func parseDay(_ any: Any?, endOfDay: Bool) -> Date? {
         guard let raw = (any as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
-              raw.count >= 10,
-              let day = dayParser.date(from: String(raw.prefix(10))) else { return nil }
+              !raw.isEmpty else { return nil }
+        // Prefer a strict YYYY-MM-DD; fall back to the relative phrasing weaker
+        // models emit ("6 months ago", "last month", "2 weeks back"). Dropping
+        // those silently was breaking date-scoped image searches: "photos from
+        // months ago" lost its window and fell back to only-recent files.
+        let day: Date?
+        if raw.count >= 10, let strict = dayParser.date(from: String(raw.prefix(10))) {
+            day = strict
+        } else {
+            day = parseRelativeDay(raw)
+        }
+        guard let day else { return nil }
         guard endOfDay else { return day }
         return Calendar.current.date(byAdding: DateComponents(day: 1, second: -1), to: day) ?? day
+    }
+
+    /// Best-effort parse of relative date phrases. Returns a start-of-day date.
+    private static func parseRelativeDay(_ raw: String) -> Date? {
+        let s = raw.lowercased()
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: Date())
+        if s.contains("today") || s.contains("now") { return today }
+        if s.contains("yesterday") { return cal.date(byAdding: .day, value: -1, to: today) }
+        // First integer in the phrase, e.g. "6" in "6 months ago"; default 1
+        // ("a month ago", "last week").
+        let n = s.split(whereSeparator: { !$0.isNumber }).first.flatMap { Int($0) } ?? 1
+        if s.contains("year") { return cal.date(byAdding: .year, value: -n, to: today) }
+        if s.contains("month") { return cal.date(byAdding: .month, value: -n, to: today) }
+        if s.contains("week") { return cal.date(byAdding: .weekOfYear, value: -n, to: today) }
+        if s.contains("day") { return cal.date(byAdding: .day, value: -n, to: today) }
+        return nil
     }
 
     /// The dict the model sees for one result. Messages carry `from` and `date`
