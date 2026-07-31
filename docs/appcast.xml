@@ -9,6 +9,16 @@
              The first entry appears with the first release cut after Sparkle
              integration (1.0.7+). -->
         <item>
+            <title>1.0.10</title>
+            <pubDate>Fri, 31 Jul 2026 18:53:59 -0400</pubDate>
+            <link>https://beaconmac.com/</link>
+            <sparkle:version>22</sparkle:version>
+            <sparkle:shortVersionString>1.0.10</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <enclosure url="https://github.com/Cool-Mac-Tools/Beacon/releases/download/v1.0.10/Beacon-1.0.10.dmg" length="3691363" type="application/octet-stream" sparkle:edSignature="U0+cm2oJ7TiYwJ+6qzKgx18jiVr+OoWwaeBDzpoUA9L8jmhBlfIPo4LFvWzgbyDM2QyjrGpvD9+VUgEOwrSQBw=="/>
+        </item>
+        <item>
             <title>1.0.9</title>
             <pubDate>Wed, 29 Jul 2026 00:44:58 -0400</pubDate>
             <link>https://beaconmac.com/</link>
