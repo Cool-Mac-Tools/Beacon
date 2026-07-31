@@ -67,7 +67,15 @@ final class RecentsStore {
         var seenPaths = Set<String>()
         out.reserveCapacity(limit * 2)
 
-        let scanRoots = roots()
+        // Code projects (git repos and marker folders like ~/coolmac-license)
+        // are noise in Recents and slow the crawl. Compute their roots once,
+        // then skip any root that is (or sits under) one and prune matching
+        // subtrees during enumeration — all cheap string prefix checks.
+        let projectRoots = JunkPath.projectRoots(under: home)
+        func isInProject(_ path: String) -> Bool {
+            projectRoots.contains { path.hasPrefix($0) || $0 == path + "/" }
+        }
+        let scanRoots = roots().filter { !isInProject($0.path) }
 
         // Fast lane: screenshots/downloads are usually top-level files. Grab
         // fresh files from those folders before any deep crawl can be slowed by
@@ -115,12 +123,10 @@ final class RecentsStore {
                     enumerator.skipDescendants()
                     continue
                 }
-                // Don't descend into a code repository nested deeper (e.g.
-                // ~/Documents/some-project). Top-level repos are already pruned
-                // in roots(); the isDirectory read is cached from the
-                // enumerator's prefetch, so this only stats `.git` on real dirs.
-                if (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true,
-                   JunkPath.isProjectRoot(url.path, fm) {
+                // Prune code-project subtrees nested deeper (e.g.
+                // ~/Documents/some-project). Pure string check against the
+                // precomputed roots — no per-item syscall.
+                if isInProject(url.path) {
                     enumerator.skipDescendants()
                     continue
                 }
@@ -279,9 +285,6 @@ final class RecentsStore {
         for entry in entries.sorted() {
             guard !entry.hasPrefix("."), entry != "Library", entry != "Applications" else { continue }
             guard !shouldSkipComponent(entry) else { continue }
-            // Skip code repositories that live directly in home (e.g. ~/Mac-search,
-            // ~/main-website) — their source files are project noise in Recents.
-            guard !JunkPath.isProjectRoot(home + "/" + entry, fm) else { continue }
             add(home + "/" + entry)
         }
 

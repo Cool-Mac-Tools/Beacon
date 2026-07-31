@@ -28,31 +28,45 @@ enum JunkPath {
         pathFragments.contains(where: path.contains)
     }
 
-    /// True when `dirPath` is the root of a code project / repository. Detected
-    /// by a `.git` entry (a directory for a normal clone, a file for a worktree
-    /// or submodule) — the generic, language-agnostic marker that catches
-    /// essentially every serious dev project without guessing by extension.
-    ///
-    /// Beacon prunes these trees from the Recents scan so a developer's source
-    /// files (index.html, LicenseStore.swift, sitemap.xml…) don't bury the real
-    /// documents you actually reach for — and so the scan stays fast instead of
-    /// walking and thumbnailing thousands of project files.
-    static func isProjectRoot(_ dirPath: String, _ fm: FileManager = .default) -> Bool {
-        fm.fileExists(atPath: dirPath + "/.git")
+    /// Filenames whose presence in a directory marks it as a code project —
+    /// broader than `.git` alone, because not every project folder is a git
+    /// repo (a fresh Cloudflare Worker, a downloaded sample, a de-initialized
+    /// clone). These are high-signal: a normal document folder doesn't contain
+    /// a package.json or a wrangler.toml.
+    static let projectMarkers: Set<String> = [
+        ".git", ".gitignore", ".hg", ".svn",
+        "package.json", "node_modules", "tsconfig.json", "jsconfig.json",
+        "Cargo.toml", "go.mod", "Package.swift",
+        "pyproject.toml", "Pipfile", "requirements.txt", "setup.py",
+        "Gemfile", "pom.xml", "build.gradle", "build.gradle.kts",
+        "composer.json", "wrangler.toml", "wrangler.jsonc", "CMakeLists.txt"
+    ]
+    /// Suffix markers (glob-shaped) checked in addition to the exact names.
+    private static let projectMarkerSuffixes = [".xcodeproj", ".xcworkspace"]
+
+    /// True when a directory's entries include any project marker.
+    static func hasProjectMarker(_ entries: [String]) -> Bool {
+        for name in entries {
+            if projectMarkers.contains(name) { return true }
+            if projectMarkerSuffixes.contains(where: name.hasSuffix) { return true }
+        }
+        return false
     }
 
     /// The root paths — each with a trailing "/" for prefix matching — of code
-    /// repositories under `home`. A shallow, bounded scan for `.git`: covers
-    /// repos that sit directly in home (the common case) and one level of
-    /// grouping folder (~/dev/foo, ~/Projects/bar) without walking a large home
-    /// tree. The Spotlight-backed views prefix-check results against this to
-    /// keep project files out of everything except the Developer pill.
+    /// projects under `home`. A shallow, bounded scan for a project marker:
+    /// covers projects that sit directly in home (the common case) and one
+    /// level of grouping folder (~/dev/foo, ~/Projects/bar) without walking a
+    /// large home tree. Every file-index view except the Developer pill
+    /// prefix-checks results against this so a developer's project files
+    /// (index.html, LicenseStore.swift, wrangler.toml…) don't bury the real
+    /// documents you actually reach for.
     static func projectRoots(under home: String, maxDepth: Int = 2,
                              _ fm: FileManager = .default) -> [String] {
         var roots: [String] = []
         func scan(_ dir: String, _ depth: Int) {
             guard let entries = try? fm.contentsOfDirectory(atPath: dir) else { return }
-            if entries.contains(".git") { roots.append(dir + "/"); return } // a repo — don't descend
+            if hasProjectMarker(entries) { roots.append(dir + "/"); return } // a project — don't descend
             guard depth < maxDepth else { return }
             for name in entries where !name.hasPrefix(".") && !components.contains(name) {
                 if depth == 0, name == "Library" || name == "Applications" { continue }
