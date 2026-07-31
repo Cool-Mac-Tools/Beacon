@@ -679,6 +679,7 @@ final class SearchEngine: ObservableObject {
     private let projectRootsLock = NSLock()
     private var projectRootPrefixes: [String] = []
     private var projectRootsComputedAt = Date.distantPast
+    private var projectRootsRefreshing = false
     private let appStore = AppStore()
     private let boundedMetadataStore = BoundedMetadataStore()
     private let settingsStore = SettingsStore()
@@ -2286,17 +2287,36 @@ final class SearchEngine: ObservableObject {
         return !JunkPath.contains(path)
     }
 
-    /// Repo roots under home, recomputed at most once a minute. Fetched ONCE per
-    /// readResults call (not per row) so the lock and the bounded `.git` scan
-    /// stay off the per-result hot path.
+    /// Project roots under home, recomputed at most once a minute. Fetched ONCE
+    /// per readResults call (not per row). The first call computes synchronously
+    /// so the very first browse is already repo-clean; every later refresh runs
+    /// on a background queue so the ~50ms scan never hitches the main thread.
     private func currentProjectRootPrefixes() -> [String] {
         projectRootsLock.lock()
-        defer { projectRootsLock.unlock() }
-        if Date().timeIntervalSince(projectRootsComputedAt) > 60 {
+        if projectRootsComputedAt == .distantPast {
             projectRootPrefixes = JunkPath.projectRoots(under: homePath)
             projectRootsComputedAt = Date()
+            defer { projectRootsLock.unlock() }
+            return projectRootPrefixes
         }
-        return projectRootPrefixes
+        let stale = Date().timeIntervalSince(projectRootsComputedAt) > 60
+        let shouldRefresh = stale && !projectRootsRefreshing
+        if shouldRefresh { projectRootsRefreshing = true }
+        let current = projectRootPrefixes
+        projectRootsLock.unlock()
+
+        if shouldRefresh {
+            recentsQueue.async { [weak self] in
+                guard let self else { return }
+                let roots = JunkPath.projectRoots(under: self.homePath)
+                self.projectRootsLock.lock()
+                self.projectRootPrefixes = roots
+                self.projectRootsComputedAt = Date()
+                self.projectRootsRefreshing = false
+                self.projectRootsLock.unlock()
+            }
+        }
+        return current
     }
 
     private func enabledDocumentExtensions() -> Set<String> {
