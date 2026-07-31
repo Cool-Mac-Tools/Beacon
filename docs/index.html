@@ -282,19 +282,6 @@
   </footer>
 
   <script src="js/main.js?v=20260712-2"></script>
-  <script>
-    // Lemon Squeezy hosted checkout — sells immediately, no domain approval.
-    // Paste the product's "Share / buy" URL (e.g.
-    // https://beaconmac.lemonsqueezy.com/buy/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).
-    var BEACON_CHECKOUT_URL = "https://beaconmac.lemonsqueezy.com/checkout/buy/636f0d26-1b9b-4ca4-8434-4476b0f132fe";
-    document.querySelectorAll("[data-buy]").forEach(function (el) {
-      el.addEventListener("click", function (e) {
-        e.preventDefault();
-        // Same-tab redirect: reliable on the first click (a new-tab window.open
-        // gets treated as a popup and can swallow the first click).
-        window.location.href = BEACON_CHECKOUT_URL;
-      });
-    });
-  </script>
+  <script src="js/purchase.js?v=1"></script>
 </body>
 </html>
