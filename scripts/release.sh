@@ -196,7 +196,7 @@ echo "==> Updating Sparkle appcast (docs/appcast.xml)..."
 APPCAST_STAGING="$(mktemp -d)"
 cp "$DMG_PATH" "$APPCAST_STAGING/"
 "$ROOT/Vendor/sparkle-tools/generate_appcast" \
-  --download-url-prefix "https://github.com/claytonwendelwon/Mac-search/releases/download/v$VERSION/" \
+  --download-url-prefix "https://github.com/Cool-Mac-Tools/Beacon/releases/download/v$VERSION/" \
   --link "https://beaconmac.com/" \
   -o "$ROOT/docs/appcast.xml" \
   "$APPCAST_STAGING"
@@ -227,33 +227,21 @@ and fixes Finder's blind spots.
 Signed with a Developer ID and notarized by Apple — no security warnings.
 
 ## What's new in $VERSION
-- **Automatic updates.** Beacon now updates itself (Sparkle). This is the
-  last version you'll ever need to download by hand.
-- **Launch at login.** Beacon survives reboots; toggle it from the
-  menu-bar menu.
-- **AI mode (new).** Describe what you're looking for in plain language and
+- **Free for now — no paywall.** Download Beacon and start searching
+  immediately. No account, no license key, no trial gate.
+- **AI mode.** Describe what you're looking for in plain language and
   Beacon returns the actual files, messages, and emails — not a chat reply.
-  Bring your own OpenAI, Claude, or Gemini key. Off by default; opt in from
-  the AI toggle.
-- **Full-disk file search.** Find files from any time, not just recent ones.
-- **Free for now.** Beacon is currently free while we move payments to a new
-  processor. The source stays public and free to build yourself.
-- **Search you can trust.** Folder results refresh mid-session and deleted
-  folders stop haunting results; videos found by type are no longer
-  dropped (and TypeScript files no longer masquerade as videos); Docs,
-  Photos, and Videos browsing skips repo junk instead of burying real
-  files; the Screenshots filter honors your custom screenshot folder;
-  Calendar finally shows recent and upcoming events.
-- **Ranking that respects your query.** Exact-name matches rank first —
-  across every source in the All view too.
-- **Fresher data.** New texts, notes, browser history, and mail are
-  findable mid-session without relaunching; contact-name search works the
-  moment Contacts loads.
-- **Much faster media browsing.** Scrolling Photos/Videos no longer
-  restarts the search per page; thumbnails load in view order.
-- **Fixes.** Quick Look no longer dismisses the panel; Cmd+C copies
-  selected search text; fast typing can't open the wrong result; stores
-  report real errors instead of wrongly demanding Full Disk Access.
+  Includes vision (find images by description) and relative-date parsing
+  ("photos from months ago"). Bring your own OpenAI, Claude, or Gemini key.
+- **Photo Library.** Search your Apple Photos library as a first-class
+  source alongside Recents and file search.
+- **Developer filter.** Opt-in source-code search for project files, with
+  code-repo junk pruned from Recents and other everyday file views.
+- **Cleaner Recents / file browsing.** Project folders and repository
+  internals no longer drown out the downloads, screenshots, and docs you
+  actually want.
+- **Automatic updates.** Beacon updates itself via Sparkle after install.
+- **Launch at login.** Survives reboots; toggle it from the menu-bar menu.
 
 ## Full Disk Access (optional)
 Messages, Notes, Mail, and Safari history need macOS **Full Disk Access**:
