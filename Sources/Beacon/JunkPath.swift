@@ -27,4 +27,17 @@ enum JunkPath {
     static func contains(_ path: String) -> Bool {
         pathFragments.contains(where: path.contains)
     }
+
+    /// True when `dirPath` is the root of a code project / repository. Detected
+    /// by a `.git` entry (a directory for a normal clone, a file for a worktree
+    /// or submodule) — the generic, language-agnostic marker that catches
+    /// essentially every serious dev project without guessing by extension.
+    ///
+    /// Beacon prunes these trees from the Recents scan so a developer's source
+    /// files (index.html, LicenseStore.swift, sitemap.xml…) don't bury the real
+    /// documents you actually reach for — and so the scan stays fast instead of
+    /// walking and thumbnailing thousands of project files.
+    static func isProjectRoot(_ dirPath: String, _ fm: FileManager = .default) -> Bool {
+        fm.fileExists(atPath: dirPath + "/.git")
+    }
 }

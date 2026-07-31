@@ -115,6 +115,15 @@ final class RecentsStore {
                     enumerator.skipDescendants()
                     continue
                 }
+                // Don't descend into a code repository nested deeper (e.g.
+                // ~/Documents/some-project). Top-level repos are already pruned
+                // in roots(); the isDirectory read is cached from the
+                // enumerator's prefetch, so this only stats `.git` on real dirs.
+                if (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true,
+                   JunkPath.isProjectRoot(url.path, fm) {
+                    enumerator.skipDescendants()
+                    continue
+                }
 
                 guard let record = record(for: url, tokens: tokens, cutoff: cutoff) else { continue }
                 guard seenPaths.insert(record.path).inserted else { continue }
@@ -270,6 +279,9 @@ final class RecentsStore {
         for entry in entries.sorted() {
             guard !entry.hasPrefix("."), entry != "Library", entry != "Applications" else { continue }
             guard !shouldSkipComponent(entry) else { continue }
+            // Skip code repositories that live directly in home (e.g. ~/Mac-search,
+            // ~/main-website) — their source files are project noise in Recents.
+            guard !JunkPath.isProjectRoot(home + "/" + entry, fm) else { continue }
             add(home + "/" + entry)
         }
 
