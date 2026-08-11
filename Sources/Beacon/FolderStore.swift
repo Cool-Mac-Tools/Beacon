@@ -9,6 +9,11 @@ struct FolderRecord {
 final class FolderStore {
     private let home: URL
     private let fm = FileManager.default
+    // `cache`/`builtAt` are read from the AI path (aiQueue) and mutated by the
+    // normal search/refresh path (folderQueue). Guard every access with this
+    // lock to avoid a data race on the Array's storage. Searches snapshot the
+    // cache under the lock and compute on the copy (cheap — copy-on-write).
+    private let lock = NSLock()
     private var cache: [FolderRecord] = []
     private var builtAt: Date?
 
@@ -16,35 +21,49 @@ final class FolderStore {
         self.home = home
     }
 
-    func prepare(isCancelled: (() -> Bool)? = nil) {
-        guard cache.isEmpty else { return }
-        let rows = buildIndex(isCancelled: isCancelled)
-        guard isCancelled?() != true else { return }
+    private func snapshot() -> (rows: [FolderRecord], isEmpty: Bool) {
+        lock.lock(); defer { lock.unlock() }
+        return (cache, cache.isEmpty)
+    }
+
+    private func store(_ rows: [FolderRecord]) {
+        lock.lock(); defer { lock.unlock() }
         cache = rows
         builtAt = Date()
     }
 
-    /// Rebuild the index when it's older than `ttl`, so folders created or
-    /// deleted mid-session show up without an app restart. Searches issued
-    /// while a rebuild runs still see the previous cache (all access is
-    /// confined to the engine's folderQueue).
-    func refreshIfStale(olderThan ttl: TimeInterval = 300,
-                        isCancelled: (() -> Bool)? = nil) {
-        if let builtAt, Date().timeIntervalSince(builtAt) < ttl { return }
+    func prepare(isCancelled: (() -> Bool)? = nil) {
+        guard snapshot().isEmpty else { return }
         let rows = buildIndex(isCancelled: isCancelled)
         guard isCancelled?() != true else { return }
-        cache = rows
-        builtAt = Date()
+        store(rows)
+    }
+
+    /// Rebuild the index when it's older than `ttl`, so folders created or
+    /// deleted mid-session show up without an app restart. Searches issued
+    /// while a rebuild runs still see the previous cache.
+    func refreshIfStale(olderThan ttl: TimeInterval = 300,
+                        isCancelled: (() -> Bool)? = nil) {
+        lock.lock()
+        let fresh = builtAt.map { Date().timeIntervalSince($0) < ttl } ?? false
+        lock.unlock()
+        if fresh { return }
+        let rows = buildIndex(isCancelled: isCancelled)
+        guard isCancelled?() != true else { return }
+        store(rows)
     }
 
     func search(tokens: [String], limit: Int = 400,
                 isCancelled: (() -> Bool)? = nil) -> [FolderRecord] {
         guard !tokens.isEmpty else { return [] }
-        if cache.isEmpty {
+        var (rows, isEmpty) = snapshot()
+        if isEmpty {
             prepare(isCancelled: isCancelled)
+            rows = snapshot().rows
         }
 
-        return cache
+        var deletedPaths: [String] = []
+        let matches = rows
             .filter { record in
                 let foldedName = record.name.searchFolded
                 return tokens.allSatisfy(foldedName.contains)
@@ -83,14 +102,24 @@ final class FolderStore {
             .map(\.0)
             .filter { record in
                 // Drop folders deleted since the index was built so ghosts
-                // never reach the results list; prune them from the cache too.
+                // never reach the results list; collect them to prune below.
                 if fm.fileExists(atPath: record.path) { return true }
-                cache.removeAll { $0.path == record.path }
+                deletedPaths.append(record.path)
                 return false
             }
+
+        // Prune the deleted folders from the shared cache under the lock.
+        if !deletedPaths.isEmpty {
+            let gone = Set(deletedPaths)
+            lock.lock()
+            cache.removeAll { gone.contains($0.path) }
+            lock.unlock()
+        }
+        return matches
     }
 
     func refresh() {
+        lock.lock(); defer { lock.unlock() }
         cache = []
         builtAt = nil
     }

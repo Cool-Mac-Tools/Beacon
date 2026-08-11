@@ -9,6 +9,12 @@ final class FilterLayoutStore: ObservableObject {
     @Published var isEditing = false
 
     private let defaultsKey = "filterLayout.v1"
+    // Records which default (non-optional) sources were known the last time the
+    // layout was saved. Any default NOT in this set is newly shipped and gets
+    // merged into the visible row — otherwise existing users would never see a
+    // source added after they first ran Beacon (this is why the Photos/Videos
+    // pills silently went missing for upgraders).
+    private let knownDefaultsKey = "filterLayout.knownDefaults.v1"
     private var orderBeforeDrag: [FileType]?
     private static let defaultVisibleFilters = FileType.allCases.filter {
         !$0.isOptionalSource && $0 != .recents
@@ -17,13 +23,28 @@ final class FilterLayoutStore: ObservableObject {
     private init() {
         let saved = UserDefaults.standard.stringArray(forKey: defaultsKey) ?? []
         let decoded = saved.compactMap(FileType.init(rawValue:))
-        let normalized = Self.normalized(
-            decoded.isEmpty ? Self.defaultVisibleFilters : decoded
-        )
-        visibleFilters = normalized
-        if saved != normalized.map(\.rawValue) {
-            UserDefaults.standard.set(normalized.map(\.rawValue), forKey: defaultsKey)
+
+        if decoded.isEmpty {
+            // Fresh install (or corrupt layout): start from the full defaults.
+            visibleFilters = Self.normalized(Self.defaultVisibleFilters)
+        } else {
+            // Merge in any default source that didn't exist when this layout was
+            // last saved, appended after the user's existing order so it's
+            // discoverable without disturbing their arrangement.
+            let known = Set((UserDefaults.standard.stringArray(forKey: knownDefaultsKey) ?? [])
+                .compactMap(FileType.init(rawValue:)))
+            let newlyShipped = Self.defaultVisibleFilters.filter {
+                !known.contains($0) && !decoded.contains($0)
+            }
+            visibleFilters = Self.normalized(decoded + newlyShipped)
         }
+
+        // Persist the (possibly migrated) layout and the current known-defaults
+        // snapshot so this merge happens exactly once per newly added source.
+        if saved != visibleFilters.map(\.rawValue) {
+            UserDefaults.standard.set(visibleFilters.map(\.rawValue), forKey: defaultsKey)
+        }
+        UserDefaults.standard.set(Self.defaultVisibleFilters.map(\.rawValue), forKey: knownDefaultsKey)
     }
 
     var hiddenFilters: [FileType] {

@@ -105,11 +105,11 @@ private struct CascadeLevelView: View {
             .padding(.vertical, 4)
         }
         .frame(width: CascadeMetrics.width, height: listHeight)
-        .background(.regularMaterial)
+        .background(Color(nsColor: .windowBackgroundColor))
         .clipShape(RoundedRectangle(cornerRadius: CascadeMetrics.corner, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: CascadeMetrics.corner, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.12))
+                .strokeBorder(Color(nsColor: .separatorColor).opacity(0.7))
         )
     }
 }

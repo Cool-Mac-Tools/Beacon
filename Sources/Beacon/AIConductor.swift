@@ -25,8 +25,9 @@ enum AIConductor {
     // Never show a giant wall of results — cap what actually gets published.
     private static let maxPresent = 10
     // Cap how many image thumbnails go to the model per look_at_images call —
-    // bounds both the payload/latency and the user's token cost.
-    private static let maxVisionImages = 9
+    // bounds both the payload/latency and the user's token cost. 12 downscaled
+    // JPEGs is a reasonable ceiling for recall vs. cost on visual queries.
+    private static let maxVisionImages = 12
 
     // MARK: - Neutral transcript & tool call
 
@@ -58,21 +59,28 @@ enum AIConductor {
 
     // MARK: - Run
 
-    static func run(query: String, engine: SearchEngine) {
+    static func run(query: String, engine: SearchEngine, generation gen: Int) {
+        // Local helpers that carry the run's generation token, so a superseded
+        // run (user re-submitted / toggled AI off) can't publish stale output.
+        func setStatus(_ s: String) { engine.aiSetStatus(s, generation: gen) }
+        func publish(_ rows: [SearchResult]) { engine.aiPublish(rows, generation: gen) }
+        // True the moment this run has been superseded; checked between rounds.
+        func superseded() -> Bool { !engine.aiIsCurrent(gen) }
+
         let settings = AISettings.shared
         // Use whichever provider actually has a key (falls back off the selected
         // tab so viewing a keyless provider doesn't dead-end the query).
         let provider = settings.effectiveProvider
         guard let key = settings.apiKey(for: provider), !key.isEmpty else {
-            engine.aiSetStatus("Add an API key in Manage to use AI mode.")
-            engine.aiPublish([])
+            setStatus("Add an API key in Manage to use AI mode.")
+            publish([])
             return
         }
         let model = settings.model(for: provider)
         let enabled = AISource.allCases.filter { settings.enabledSources.contains($0) }
         guard !enabled.isEmpty else {
-            engine.aiSetStatus("No sources enabled for AI mode.")
-            engine.aiPublish([])
+            setStatus("No sources enabled for AI mode.")
+            publish([])
             return
         }
 
@@ -80,8 +88,8 @@ enum AIConductor {
         // the query if literally everything the user enabled needs FDA.
         let sources = engine.aiUsableSources(enabled)
         guard !sources.isEmpty else {
-            engine.aiSetStatus("Grant Full Disk Access to search Messages/Mail/Notes, then reopen Beacon.")
-            engine.aiPublish([])
+            setStatus("Grant Full Disk Access to search Messages/Mail/Notes, then reopen Beacon.")
+            publish([])
             return
         }
 
@@ -92,21 +100,34 @@ enum AIConductor {
         let tools = toolSpecs(sources: sources)
         var turns: [Turn] = [.user(query)]
 
+        var nudgedForTool = false
         for round in 0..<maxRounds {
-            engine.aiSetStatus(round == 0 ? "Thinking…" : "Refining…")
+            if superseded() { return }
+            setStatus(round == 0 ? "Thinking…" : "Refining…")
             guard let response = chat(provider: provider, key: key, model: model,
                                       system: system, tools: tools, turns: turns) else {
-                engine.aiSetStatus("Couldn't reach \(provider.displayName). Check your key and connection.")
-                engine.aiPublish(Array(pool.prefix(maxPresent)))   // a few candidates, never the full pool
+                if superseded() { return }
+                setStatus("Couldn't reach \(provider.displayName). Check your key and connection.")
+                publish(Array(pool.prefix(maxPresent)))   // a few candidates, never the full pool
                 return
             }
+            if superseded() { return }
             turns.append(.assistant(text: response.text, toolCalls: response.toolCalls))
 
             guard !response.toolCalls.isEmpty else {
-                // No tool call — nothing more to do. Fall back to a few of
-                // what it surfaced (capped, never the full unranked pool) so
-                // the user still gets locations.
-                engine.aiPublish(Array(pool.prefix(maxPresent)))
+                // The model replied with prose instead of a tool call. Weaker
+                // models do this on the first turn; nudge them ONCE to use the
+                // tools before giving up — dumping an arbitrary unranked pool
+                // prefix as if it were the answer is worse than one more round.
+                if !nudgedForTool, round < maxRounds - 1 {
+                    nudgedForTool = true
+                    turns.append(.user("Do not answer in prose. Use the tools: call `search` to find items, then `present_results` with the matching ref(s). If nothing matches, call present_results with an empty list."))
+                    continue
+                }
+                // Still no tool call — surface a few of what it surfaced
+                // (capped, never the full unranked pool) so the user still
+                // gets locations rather than a dead end.
+                publish(Array(pool.prefix(maxPresent)))
                 return
             }
 
@@ -122,11 +143,11 @@ enum AIConductor {
                     let refs = (args["refs"] as? [Any])?.compactMap { intFrom($0) } ?? []
                     let chosen = refs.compactMap { $0 >= 0 && $0 < pool.count ? pool[$0] : nil }
                     Log.debug("AI present_results refs=\(refs.count) resolved=\(chosen.count)")
-                    engine.aiSetStatus("")
+                    setStatus("")
                     // Publish exactly what the model chose (capped). An explicit
                     // empty selection means "nothing matched" — show nothing,
                     // never fall back to dumping the whole candidate pool.
-                    engine.aiPublish(Array(chosen.prefix(maxPresent)))
+                    publish(Array(chosen.prefix(maxPresent)))
                     return
                 }
 
@@ -135,8 +156,12 @@ enum AIConductor {
                     let keywords = args["keywords"] as? String ?? ""
                     let from = (args["from"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
                     let fileType = (args["fileType"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-                    let after = parseDay(args["after"], endOfDay: false)
-                    let before = parseDay(args["before"], endOfDay: true)
+                    var after = parseDay(args["after"], endOfDay: false)
+                    var before = parseDay(args["before"], endOfDay: true)
+                    // Guard an inverted window: if the model swapped the bounds
+                    // (after later than before), the date filter would reject
+                    // everything and silently return zero results. Swap them.
+                    if let a = after, let b = before, a > b { swap(&after, &before) }
                     // When a hard filter (sender/date/type) has narrowed the set,
                     // hand the model the WHOLE set so it can read to find items
                     // whose own text lacks the keywords (raw credentials, codes).
@@ -146,7 +171,7 @@ enum AIConductor {
                     let limit = min(intFrom(args["limit"] ?? 0) ?? cap, cap)
                     let source = AISource(rawValue: sourceRaw)
                     if let source, sources.contains(source) {
-                        engine.aiSetStatus("Searching \(source.displayName)…")
+                        setStatus("Searching \(source.displayName)…")
                         let tokens = SearchText.tokens(keywords)
                         let rows = engine.aiToolSearch(
                             source, tokens: tokens, limit: limit > 0 ? limit : perSearchCap,
@@ -171,7 +196,7 @@ enum AIConductor {
                     let ref = intFrom(args["ref"] ?? -1) ?? -1
                     let target = (ref >= 0 && ref < pool.count) ? pool[ref] : nil
                     if let target, target.source == .message, let rowid = target.messageRowID {
-                        engine.aiSetStatus("Reading the conversation…")
+                        setStatus("Reading the conversation…")
                         let thread = engine.aiThreadContext(around: rowid)
                         var out: [[String: Any]] = []
                         for row in thread {
@@ -186,7 +211,7 @@ enum AIConductor {
                     // Vision: render thumbnails of the requested image results and
                     // hand them to the model to inspect in the next user turn.
                     let refs = (args["refs"] as? [Any])?.compactMap { intFrom($0) } ?? []
-                    engine.aiSetStatus("Looking at the images…")
+                    setStatus("Looking at the images…")
                     var shown: [Int] = []
                     for ref in refs where ref >= 0 && ref < pool.count {
                         guard visionImages.count < maxVisionImages else { break }
@@ -216,7 +241,7 @@ enum AIConductor {
         // Ran out of rounds without committing. Rather than dumping the whole
         // accumulated pool (unordered, noisy — the answer buried among unrelated
         // hits), force ONE decisive pick from what's already been surfaced.
-        engine.aiSetStatus("Finishing…")
+        setStatus("Finishing…")
         turns.append(.user("Stop searching. From the results you've already seen, call present_results NOW with only the ref(s) that best answer the request — usually exactly one item that IS the answer."))
         if let response = chat(provider: provider, key: key, model: model,
                                system: system, tools: tools, turns: turns),
@@ -224,14 +249,14 @@ enum AIConductor {
             let refs = (call.args["refs"] as? [Any])?.compactMap { intFrom($0) } ?? []
             let chosen = refs.compactMap { $0 >= 0 && $0 < pool.count ? pool[$0] : nil }
             if !chosen.isEmpty {
-                engine.aiSetStatus("")
-                engine.aiPublish(Array(chosen.prefix(maxPresent)))
+                setStatus("")
+                publish(Array(chosen.prefix(maxPresent)))
                 return
             }
         }
         // Last resort: a few candidates, never the full pool.
-        engine.aiSetStatus("")
-        engine.aiPublish(Array(pool.prefix(maxPresent)))
+        setStatus("")
+        publish(Array(pool.prefix(maxPresent)))
     }
 
     // MARK: - Prompt & tool specs
@@ -495,7 +520,10 @@ enum AIConductor {
         guard r.source == .file, !r.path.isEmpty else { return false }
         if r.contentTypes.contains(where: { $0.contains("image") }) { return true }
         let ext = (r.path as NSString).pathExtension.lowercased()
-        return ["jpg","jpeg","png","gif","heic","heif","webp","tiff","bmp","psd"].contains(ext)
+        // ImageIO downscales all of these to a JPEG thumbnail during decode, so
+        // RAW/AVIF/etc. are all fair game for vision — not just web formats.
+        return ["jpg","jpeg","png","gif","heic","heif","webp","tiff","tif","bmp","psd",
+                "avif","dng","cr2","cr3","arw","nef","raf","orf","rw2"].contains(ext)
     }
 
     /// Decode a downscaled JPEG thumbnail of an image file and base64-encode it.
@@ -555,22 +583,39 @@ enum AIConductor {
     /// request may have reached the model, and re-sending would double-charge
     /// the user's tokens.
     private static func send(_ request: URLRequest) -> [String: Any]? {
-        for attempt in 0..<2 {
+        let maxAttempts = 3
+        for attempt in 0..<maxAttempts {
             let sem = DispatchSemaphore(value: 0)
             var out: Data?
+            var status = 0
             var transportFailed = false
-            URLSession.shared.dataTask(with: request) { d, _, error in
+            URLSession.shared.dataTask(with: request) { d, resp, error in
                 out = d
+                status = (resp as? HTTPURLResponse)?.statusCode ?? 0
                 transportFailed = (error != nil)
                 sem.signal()
             }.resume()
             guard sem.wait(timeout: .now() + 65) == .success else { return nil }
+
+            let isLast = attempt == maxAttempts - 1
+            // Retryable: transient server-side (429 rate limit, 500/502/503, and
+            // Anthropic's 529 "overloaded") or a transport failure where the
+            // server never answered. Back off briefly and try again — a single
+            // rate-limit blip shouldn't abort the whole query with a misleading
+            // "check your key" message. We do NOT retry on our own 65s timeout
+            // (handled above by returning nil) to avoid double-charging tokens.
+            let retryableStatus = status == 429 || status == 529 || (status >= 500 && status <= 599)
+            if !isLast, (retryableStatus || transportFailed) {
+                // Simple linear backoff: ~0.8s, then ~1.6s. Safe on aiQueue —
+                // we're already off the main thread.
+                Thread.sleep(forTimeInterval: 0.8 * Double(attempt + 1))
+                continue
+            }
+
             if let out,
                let json = try? JSONSerialization.jsonObject(with: out) as? [String: Any] {
                 return json
             }
-            // No usable body. Retry once only if the server never answered.
-            if transportFailed, attempt == 0 { continue }
             return nil
         }
         return nil
@@ -681,8 +726,11 @@ enum AIConductor {
         let toolSpecs = tools.map { t -> [String: Any] in
             ["name": t.name, "description": t.description, "input_schema": t.parameters]
         }
+        // 4096 (up from 2048) leaves headroom for a round that issues several
+        // tool calls alongside reasoning; a truncated tool_use block would parse
+        // with empty args and waste a whole round on an "unknown source" error.
         let body: [String: Any] = [
-            "model": model, "max_tokens": 2048, "system": system,
+            "model": model, "max_tokens": 4096, "system": system,
             "messages": messages, "tools": toolSpecs, "tool_choice": ["type": "auto"],
         ]
         guard let url = URL(string: "https://api.anthropic.com/v1/messages") else { return nil }

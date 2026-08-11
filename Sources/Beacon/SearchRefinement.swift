@@ -616,6 +616,10 @@ enum RefinementMatcher {
         }
         switch dimension {
         case "location":
+            // "Photo Library" can appear as a Location option (Videos filter);
+            // route it through the sourceApp-aware matcher so tagged assets
+            // outside the .photoslibrary package still match.
+            if option == "photos-library" { return matchesPhotoSource(result, option) }
             return matchesLocation(result.path, option)
         case "time", "photo-date", "recent-use", "recent-open":
             if type == .calendar {

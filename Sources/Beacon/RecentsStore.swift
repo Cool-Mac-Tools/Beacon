@@ -34,6 +34,10 @@ final class RecentsStore {
     private var lastScanAt = Date.distantPast
     private var freshCache: [RecentFileRecord] = []
     private var freshCachedAt = Date.distantPast
+    // Bumped on every refresh() so an in-flight freshItems() scan that started
+    // before the refresh won't commit its now-stale snapshot (which would
+    // resurrect a just-deleted file into the Recents feed).
+    private var freshGeneration = 0
 
     private let resourceKeys: Set<URLResourceKey> = [
         .isDirectoryKey,
@@ -168,6 +172,7 @@ final class RecentsStore {
             cacheLock.unlock()
             return cached
         }
+        let startGeneration = freshGeneration
         cacheLock.unlock()
         let cutoff = Date(timeIntervalSinceNow: -freshLaneHours * 3_600)
         var rows: [RecentFileRecord] = []
@@ -194,8 +199,12 @@ final class RecentsStore {
                 return $0.name.localizedStandardCompare($1.name) == .orderedAscending
             }
         cacheLock.lock()
-        freshCache = sorted
-        freshCachedAt = Date()
+        // Only commit if no refresh() intervened while we were scanning —
+        // otherwise we'd overwrite a deliberately-cleared cache with stale data.
+        if startGeneration == freshGeneration {
+            freshCache = sorted
+            freshCachedAt = Date()
+        }
         cacheLock.unlock()
         return Array(sorted.prefix(limit))
     }
@@ -204,6 +213,7 @@ final class RecentsStore {
         cacheLock.lock()
         freshCache = []
         freshCachedAt = .distantPast
+        freshGeneration &+= 1
         guard Date().timeIntervalSince(lastScanAt) >= 300 else {
             cacheLock.unlock()
             return

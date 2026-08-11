@@ -596,6 +596,9 @@ final class SearchEngine: ObservableObject {
     @Published var aiMode: Bool = false {
         didSet {
             guard aiMode != oldValue else { return }
+            // Invalidate any in-flight AI run so its async callbacks can't
+            // republish results/status after the mode has changed.
+            bumpAIGeneration()
             aiRunning = false
             aiStatus = ""
             if aiMode {
@@ -622,6 +625,26 @@ final class SearchEngine: ObservableObject {
     /// Serial queue for the AI agent loop so tool searches don't race the
     /// normal (mode-off) search path, which shares the same store instances.
     private let aiQueue = DispatchQueue(label: "com.beacon.ai", qos: .userInitiated)
+
+    /// Monotonic token identifying the *current* AI run. Bumped whenever a new
+    /// AI query starts or AI mode is toggled, so a superseded run (still winding
+    /// down on `aiQueue`) can detect it's stale and bail before it publishes
+    /// results/status for an old query over a new one. Guarded by its own lock
+    /// because it's written on main but read from `aiQueue`.
+    private let aiGenLock = NSLock()
+    private var _aiGeneration = 0
+    /// Start a new AI generation and return its token (call on main).
+    @discardableResult
+    func bumpAIGeneration() -> Int {
+        aiGenLock.lock(); defer { aiGenLock.unlock() }
+        _aiGeneration &+= 1
+        return _aiGeneration
+    }
+    /// True if `gen` is still the active AI run (safe to call from any thread).
+    func aiIsCurrent(_ gen: Int) -> Bool {
+        aiGenLock.lock(); defer { aiGenLock.unlock() }
+        return _aiGeneration == gen
+    }
 
     /// When non-nil, Beacon is browsing the immediate contents of this folder
     /// (Finder-style drill-in) instead of running a Spotlight search. Typing
@@ -1397,13 +1420,30 @@ final class SearchEngine: ObservableObject {
                     .map { SearchResult(message: $0, contactName: self.contacts.name(for: $0.conversationHandle)) }
             }
         case .mail:
-            return Array(dated(mailStore.search(tokens: tokens, limit: wide).map { SearchResult(mail: $0) }).prefix(limit))
+            // These stores aren't internally synchronized; the normal search
+            // path touches each only from its dedicated queue. Serialize the AI
+            // path there too (matching the Messages case above) so an AI tool
+            // search can't race a normal search / launch-time load of the store.
+            return mailQueue.sync {
+                mailStore.ensureLoaded()
+                guard !mailStore.needsFullDiskAccess else { return [] }
+                return Array(dated(mailStore.search(tokens: tokens, limit: wide).map { SearchResult(mail: $0) }).prefix(limit))
+            }
         case .notes:
-            return Array(dated(notesStore.search(tokens: tokens, limit: wide).map { SearchResult(note: $0) }).prefix(limit))
+            return notesQueue.sync {
+                notesStore.ensureLoaded()
+                guard !notesStore.needsFullDiskAccess else { return [] }
+                return Array(dated(notesStore.search(tokens: tokens, limit: wide).map { SearchResult(note: $0) }).prefix(limit))
+            }
         case .calendar:
-            return Array(dated(calendarStore.search(tokens: tokens, limit: wide).map { SearchResult(calendar: $0) }).prefix(limit))
+            return calendarQueue.sync {
+                Array(dated(calendarStore.search(tokens: tokens, limit: wide).map { SearchResult(calendar: $0) }).prefix(limit))
+            }
         case .history:
-            return Array(dated(historyStore.search(tokens: tokens, limit: wide).map { SearchResult(history: $0) }).prefix(limit))
+            return historyQueue.sync {
+                historyStore.ensureLoaded()
+                return Array(dated(historyStore.search(tokens: tokens, limit: wide).map { SearchResult(history: $0) }).prefix(limit))
+            }
         case .clipboard:
             return Array(dated(ClipboardStore.shared.search(tokens: tokens, limit: wide).map { SearchResult(clip: $0) }).prefix(limit))
         case .apps:
@@ -1411,9 +1451,17 @@ final class SearchEngine: ObservableObject {
         case .folders:
             return Array(dated(folderStore.search(tokens: tokens, limit: wide).map { SearchResult(folder: $0) }).prefix(limit))
         case .files:
+            let ft0 = fileType?.lowercased() ?? ""
+            let isMedia = ["image", "images", "photo", "photos", "video", "videos", "movie"].contains(ft0)
+            // For visual media the user's keywords describe what the picture
+            // SHOWS, not its filename — matching them against names (IMG_1234)
+            // would exclude the very photos vision needs to inspect. Gather the
+            // type+date-narrowed set WITHOUT keyword filtering so the model can
+            // look at the pixels; keep keyword filtering for real documents.
+            let fileTokens = isMedia ? [] : tokens
             // Full-disk Spotlight (MDQuery) — finds files beyond the recents
             // window, hard-filtered by type + date in the query itself.
-            let hits = SpotlightFileSearch.search(tokens: tokens, fileType: fileType,
+            let hits = SpotlightFileSearch.search(tokens: fileTokens, fileType: fileType,
                                                   after: after, before: before, limit: wide)
             var rows: [SearchResult] = hits.map { hit in
                 SearchResult(id: hit.path, name: hit.name, path: hit.path,
@@ -1427,9 +1475,8 @@ final class SearchEngine: ObservableObject {
             // Photo library (PhotoKit) — Spotlight doesn't index inside the
             // .photoslibrary package, so pull image/video assets directly when
             // the query is media-oriented, and merge by real on-disk path.
-            let ft = fileType?.lowercased() ?? ""
-            let wantImage = ["image", "images", "photo", "photos"].contains(ft)
-            let wantVideo = ["video", "videos", "movie"].contains(ft)
+            let wantImage = ["image", "images", "photo", "photos"].contains(ft0)
+            let wantVideo = ["video", "videos", "movie"].contains(ft0)
             if wantImage || wantVideo {
                 var seen = Set(rows.map(\.path))
                 for h in PhotoStore.search(wantImage: wantImage, wantVideo: wantVideo,
@@ -1448,7 +1495,7 @@ final class SearchEngine: ObservableObject {
 
             if !rows.isEmpty { return Array(rows.prefix(limit)) }
             // Fallback to recent files (e.g. a type-only browse Spotlight declined).
-            let recs = recentsStore.search(tokens: tokens, limit: wide)
+            let recs = recentsStore.search(tokens: fileTokens, limit: wide)
                 .filter { Self.matchesFileType($0.contentTypes, kind: $0.kind, path: $0.path, want: fileType) }
                 .map { SearchResult(recent: $0) }
             return Array(dated(recs).prefix(limit))
@@ -1499,8 +1546,11 @@ final class SearchEngine: ObservableObject {
         }
     }
 
-    func aiSetStatus(_ text: String) {
-        DispatchQueue.main.async { self.aiStatus = text }
+    func aiSetStatus(_ text: String, generation: Int) {
+        DispatchQueue.main.async {
+            guard self.aiIsCurrent(generation) else { return }
+            self.aiStatus = text
+        }
     }
 
     /// Return the enabled sources the AI can actually search right now, dropping
@@ -1510,9 +1560,17 @@ final class SearchEngine: ObservableObject {
     /// surface the Full Disk Access prompt. Runs on aiQueue.
     func aiUsableSources(_ sources: [AISource]) -> [AISource] {
         var blocked: Set<AISource> = []
-        if sources.contains(.messages) { _ = messageStore.probeAccess(); if messageStore.needsFullDiskAccess { blocked.insert(.messages) } }
-        if sources.contains(.mail) { mailStore.ensureLoaded(); if mailStore.needsFullDiskAccess { blocked.insert(.mail) } }
-        if sources.contains(.notes) { notesStore.ensureLoaded(); if notesStore.needsFullDiskAccess { blocked.insert(.notes) } }
+        // Probe each store on its own queue so this (running on aiQueue) can't
+        // race a normal-path load/search of the same store.
+        if sources.contains(.messages) {
+            messageQueue.sync { _ = messageStore.probeAccess(); if messageStore.needsFullDiskAccess { blocked.insert(.messages) } }
+        }
+        if sources.contains(.mail) {
+            mailQueue.sync { mailStore.ensureLoaded(); if mailStore.needsFullDiskAccess { blocked.insert(.mail) } }
+        }
+        if sources.contains(.notes) {
+            notesQueue.sync { notesStore.ensureLoaded(); if notesStore.needsFullDiskAccess { blocked.insert(.notes) } }
+        }
         let usable = sources.filter { !blocked.contains($0) }
         let allBlocked = usable.isEmpty && !blocked.isEmpty
         DispatchQueue.main.async {
@@ -1527,8 +1585,11 @@ final class SearchEngine: ObservableObject {
 
     /// Publish the AI-chosen locations, preserving the agent's ranking order
     /// (no relevance re-sort, unlike normal search).
-    func aiPublish(_ rows: [SearchResult]) {
+    func aiPublish(_ rows: [SearchResult], generation: Int) {
         DispatchQueue.main.async {
+            // A superseded run (user re-submitted, toggled AI off, or started a
+            // new query) must not overwrite the current results/state.
+            guard self.aiIsCurrent(generation) else { return }
             var seen = Set<String>()
             let deduped = rows.filter { seen.insert($0.id).inserted }
             self.aiRunning = false
@@ -1544,13 +1605,16 @@ final class SearchEngine: ObservableObject {
     func runAIQuery(_ query: String) {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        // Supersede any in-flight run: a new generation invalidates the old one,
+        // which will notice and bail before it publishes over these results.
+        let gen = bumpAIGeneration()
         aiRunning = true
         aiStatus = "Thinking…"
         isSearching = true
         results = []
         aiQueue.async { [weak self] in
             guard let self else { return }
-            AIConductor.run(query: trimmed, engine: self)
+            AIConductor.run(query: trimmed, engine: self, generation: gen)
         }
     }
 
@@ -1789,6 +1853,12 @@ final class SearchEngine: ObservableObject {
         let cap = tokens.isEmpty ? 60 : 40
         photoQueue.async { [weak self] in
             guard let self else { return }
+            // Tag these as coming from the Photos library so the "Photo Library"
+            // source refinement matches them even when the resolved on-disk path
+            // isn't inside the .photoslibrary package (iCloud-optimized or
+            // referenced libraries), which path-only matching would miss.
+            var photoFacets = RefinementFacets()
+            photoFacets.sourceApp = "photos-library"
             let rows = PhotoStore.search(wantImage: wantImage, wantVideo: wantVideo,
                                          after: nil, before: nil, limit: cap, tokens: tokens)
                 .map { h in
@@ -1798,7 +1868,7 @@ final class SearchEngine: ObservableObject {
                                  dateAdded: h.creationDate,
                                  isFolder: false, isApp: false,
                                  contentTypes: [h.isVideo ? "public.movie" : "public.image"],
-                                 matchKind: .name)
+                                 matchKind: .name, facets: photoFacets)
                 }
             DispatchQueue.main.async {
                 guard token == self.searchToken, self.selectedType == type,

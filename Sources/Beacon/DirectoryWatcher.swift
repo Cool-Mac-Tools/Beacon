@@ -6,7 +6,6 @@ import Foundation
 /// it appears without reopening the panel. Dependency-free (GCD vnode source).
 final class DirectoryWatcher {
     private var source: DispatchSourceFileSystemObject?
-    private var fd: Int32 = -1
     private var debounce: DispatchWorkItem?
     private let onChange: () -> Void
 
@@ -19,17 +18,16 @@ final class DirectoryWatcher {
         stop()
         let openFD = open(url.path, O_EVTONLY)
         guard openFD >= 0 else { return }
-        fd = openFD
         let src = DispatchSource.makeFileSystemObjectSource(
             fileDescriptor: openFD,
             eventMask: [.write, .delete, .rename, .link],
             queue: DispatchQueue.global(qos: .utility)
         )
         src.setEventHandler { [weak self] in self?.scheduleFire() }
-        src.setCancelHandler { [weak self] in
-            if let fd = self?.fd, fd >= 0 { close(fd) }
-            self?.fd = -1
-        }
+        // Capture THIS source's own fd. Reading a shared `self.fd` here raced a
+        // rapid re-watch: the new watch() overwrote self.fd before this stale
+        // handler ran, so it closed the live fd and killed the new watcher.
+        src.setCancelHandler { close(openFD) }
         source = src
         src.resume()
     }

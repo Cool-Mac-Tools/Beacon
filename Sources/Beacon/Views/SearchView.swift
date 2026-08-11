@@ -95,41 +95,15 @@ struct SearchView: View {
             .clipped()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(.thinMaterial)
-        .background {
-            LinearGradient(
-                colors: [
-                    Color.white.opacity(colorScheme == .dark ? 0.13 : 0.38),
-                    Color.white.opacity(colorScheme == .dark ? 0.055 : 0.18),
-                    Color.accentColor.opacity(colorScheme == .dark ? 0.035 : 0.025)
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-        }
+        // Solid, native "OS tool" surface (matches Reclaim) — no vibrancy,
+        // no glass gradients. Opaque system window background that adapts to
+        // light/dark, with a single hairline edge and the panel's own shadow.
+        .background(Color(nsColor: .windowBackgroundColor))
         .clipShape(panelShape)
         .overlay(
             panelShape
-                .strokeBorder(
-                    LinearGradient(
-                        colors: [
-                            Color.white.opacity(colorScheme == .dark ? 0.30 : 0.78),
-                            Color.white.opacity(0.08),
-                            Color.primary.opacity(0.10)
-                        ],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    ),
-                    lineWidth: 1
-                )
+                .strokeBorder(Color(nsColor: .separatorColor).opacity(0.7), lineWidth: 0.5)
         )
-        .overlay(alignment: .top) {
-            panelShape
-                .strokeBorder(Color.white.opacity(colorScheme == .dark ? 0.12 : 0.42), lineWidth: 0.5)
-                .blur(radius: 0.2)
-                .padding(1)
-                .allowsHitTesting(false)
-        }
         .onChange(of: engine.results) { _ in
             selectedIndex = engine.results.isEmpty ? 0 : min(selectedIndex, engine.results.count - 1)
             selectedIndex = max(0, selectedIndex)
@@ -332,30 +306,18 @@ struct SearchView: View {
     }
 
     private var panelShape: RoundedRectangle {
-        RoundedRectangle(cornerRadius: 24, style: .continuous)
+        RoundedRectangle(cornerRadius: 12, style: .continuous)
     }
 
     private var glassDivider: some View {
         Rectangle()
-            .fill(
-                LinearGradient(
-                    colors: [.clear, Color.primary.opacity(0.10), .clear],
-                    startPoint: .leading,
-                    endPoint: .trailing
-                )
-            )
+            .fill(Color(nsColor: .separatorColor))
             .frame(height: 0.5)
     }
 
     private var verticalGlassDivider: some View {
         Rectangle()
-            .fill(
-                LinearGradient(
-                    colors: [.clear, Color.primary.opacity(0.11), .clear],
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
-            )
+            .fill(Color(nsColor: .separatorColor))
             .frame(width: 0.5)
     }
 
@@ -2466,7 +2428,14 @@ struct SearchView: View {
     /// Enter behavior: in AI mode a fresh question runs the agent; once results
     /// are shown, Enter opens the highlighted one (edit the question to re-ask).
     private func handleSubmit() {
-        guard engine.aiMode else { openSelected(); return }
+        guard engine.aiMode else {
+            // While a newer query is still debouncing/loading, `results` holds
+            // the PREVIOUS query's rows. Pressing Return then would open the
+            // wrong file, so wait for fresh results instead of acting on stale.
+            if engine.isShowingStaleResults { return }
+            openSelected()
+            return
+        }
         let q = engine.queryText.trimmingCharacters(in: .whitespacesAndNewlines)
         if q != (lastAISubmitted ?? "") || engine.results.isEmpty {
             lastAISubmitted = q
