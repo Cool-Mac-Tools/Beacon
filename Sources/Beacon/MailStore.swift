@@ -50,6 +50,8 @@ final class MailStore {
         let deletedClause: String
     }
 
+    private let databaseOverride: URL?
+    init(databaseURL: URL? = nil) { databaseOverride = databaseURL }
     private(set) var state: State = .idle
     private var schema: Schema?
     private var lastTokens: [String] = []
@@ -62,7 +64,7 @@ final class MailStore {
 
     func ensureLoaded() {
         guard state == .idle else { return }
-        guard let databasePath = locateDatabase() else { return }
+        guard let databasePath = databaseOverride?.path ?? locateDatabase() else { return }
 
         var db: OpaquePointer?
         defer { if db != nil { sqlite3_close(db) } }
@@ -103,10 +105,12 @@ final class MailStore {
     }
 
     func search(tokens: [String], limit: Int = 80,
-                gmailOnly: Bool = false,
+                gmailOnly: Bool = false, sender: String? = nil, after: Date? = nil, before: Date? = nil,
                 isCancelled: (() -> Bool)? = nil) -> [MailRecord] {
         guard state == .ready, let schema else { return [] }
-        if tokens == lastTokens, gmailOnly == lastSearchWasGmailOnly,
+        let senderTokens = SearchText.tokens(sender ?? "")
+        let filtered = !senderTokens.isEmpty || after != nil || before != nil
+        if !filtered, tokens == lastTokens, gmailOnly == lastSearchWasGmailOnly,
            lastMatches.count >= limit {
             return Array(lastMatches.prefix(limit))
         }
@@ -128,6 +132,11 @@ final class MailStore {
         let searchClause = tokenClauses.isEmpty
             ? "1 = 1"
             : tokenClauses.joined(separator: " AND ")
+        let senderClause = senderTokens.map { _ in
+            "(\(schema.senderAddressExpression) LIKE ? ESCAPE '\\' COLLATE NOCASE OR \(schema.senderNameExpression) LIKE ? ESCAPE '\\' COLLATE NOCASE)"
+        }.joined(separator: " AND ")
+        // Match mailDate's epoch normalization before limiting candidates.
+        let unixDate = "(CASE WHEN \(schema.dateExpression) > 1200000000 THEN \(schema.dateExpression) ELSE \(schema.dateExpression) + 978307200 END)"
         let scanLimit = max(500, limit * 10)
         let sql = """
         SELECT m.ROWID,
@@ -149,9 +158,12 @@ final class MailStore {
         \(schema.mailboxJoin)
         \(schema.globalDataJoin)
         WHERE \(searchClause)
+              \(senderClause.isEmpty ? "" : "AND " + senderClause)
+              \(after == nil ? "" : "AND " + unixDate + " >= ?")
+              \(before == nil ? "" : "AND " + unixDate + " <= ?")
               \(schema.deletedClause)
               \(gmailOnly ? "AND LOWER(\(schema.mailboxExpression)) LIKE '%gmail%'" : "")
-        ORDER BY \(schema.dateExpression) DESC
+        ORDER BY \(unixDate) DESC
         LIMIT \(scanLimit);
         """
 
@@ -171,6 +183,14 @@ final class MailStore {
             }
         }
 
+        for token in senderTokens {
+            let pattern = "%" + Self.escapeLike(token) + "%"
+            for _ in 0..<2 {
+                sqlite3_bind_text(stmt, bindIndex, pattern, -1, SQLITE_TRANSIENT); bindIndex += 1
+            }
+        }
+        if let after { sqlite3_bind_double(stmt, bindIndex, after.timeIntervalSince1970); bindIndex += 1 }
+        if let before { sqlite3_bind_double(stmt, bindIndex, before.timeIntervalSince1970); bindIndex += 1 }
         var scored: [(MailRecord, SearchText.MatchQuality)] = []
         var rowIndex = 0
         while sqlite3_step(stmt) == SQLITE_ROW {
@@ -208,9 +228,11 @@ final class MailStore {
             if $0.1 != $1.1 { return $0.1 < $1.1 }
             return $0.0.received > $1.0.received
         }.map(\.0)
-        lastTokens = tokens
-        lastMatches = matches
-        lastSearchWasGmailOnly = gmailOnly
+        if !filtered {
+            lastTokens = tokens
+            lastMatches = matches
+            lastSearchWasGmailOnly = gmailOnly
+        }
         Log.debug("MailStore: tokens=\(tokens) matched=\(matches.count)")
         return Array(matches.prefix(limit))
     }

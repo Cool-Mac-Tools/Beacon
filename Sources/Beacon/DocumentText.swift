@@ -35,11 +35,25 @@ enum DocumentText {
     static func centered(_ text: String, query: String, limit: Int) -> String {
         guard limit > 0 else { return "" }
         let source = text as NSString
-        let tokens = SearchText.tokens(query).filter { $0.count >= 3 }
-        let position = tokens.compactMap { token -> Int? in
-            let range = source.range(of: token, options: [.caseInsensitive, .diacriticInsensitive])
-            return range.location == NSNotFound ? nil : range.location
-        }.min() ?? 0
+        let tokens = Array(Set(SearchText.tokens(query).filter { $0.count >= 3 })).sorted().prefix(12)
+        var positions: [Int] = [0]
+        for token in tokens {
+            var cursor = 0
+            for _ in 0..<24 {
+                guard cursor < source.length else { break }
+                let range = source.range(of: token, options: [.caseInsensitive, .diacriticInsensitive], range: NSRange(location: cursor, length: source.length - cursor))
+                guard range.location != NSNotFound else { break }
+                positions.append(range.location); cursor = NSMaxRange(range)
+            }
+        }
+        func relevance(_ position: Int) -> Int {
+            let start = max(0, position - limit / 4)
+            let range = NSRange(location: start, length: min(limit, source.length - start))
+            return tokens.reduce(0) { score, token in
+                score + (source.range(of: token, options: [.caseInsensitive, .diacriticInsensitive], range: range).location == NSNotFound ? 0 : 1)
+            }
+        }
+        let position = positions.max { relevance($0) < relevance($1) } ?? 0
         let start = max(0, position - limit / 4)
         let range = source.rangeOfComposedCharacterSequences(for: NSRange(location: start, length: min(limit, source.length - start)))
         return (range.location > 0 ? "…" : "") + source.substring(with: range) + (NSMaxRange(range) < source.length ? "…" : "")

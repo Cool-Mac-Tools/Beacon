@@ -20,59 +20,73 @@ enum SpotlightFileSearch {
         var isFolder: Bool { contentType == "public.folder" }
     }
 
-    /// Build and run a synchronous MDQuery. `tokens` are ANDed (each must appear
-    /// in the name or text content); `fileType`/`after`/`before` are hard
-    /// filters. Returns up to `limit` hits, newest first.
-    static func search(tokens: [String], fileType: String?,
-                       after: Date?, before: Date?, limit: Int) -> [Hit] {
+    /// Gather separate filename and content lanes. Each lane is sorted by the
+    /// metadata engine before its cap; a strong old filename match can survive
+    /// a large set of recent incidental content matches.
+    static func search(tokens: [String], fileType: String?, after: Date?, before: Date?, limit: Int,
+                       report: (String) -> Void = { _ in }) -> [Hit] {
+        guard limit > 0 else { return [] }
+        let cap = min(800, max(100, limit * 2))
+        var hits: [Hit] = []
+        if !tokens.isEmpty, let nameQuery = predicate(tokens: tokens, fileType: fileType, after: after, before: before, nameOnly: true) {
+            report("Filename search · cap \(cap)\n\(nameQuery)")
+            hits += gather(nameQuery, limit: cap)
+        }
+        if let contentQuery = predicate(tokens: tokens, fileType: fileType, after: after, before: before) {
+            report("Name/content search · cap \(cap)\n\(contentQuery)")
+            hits += gather(contentQuery, limit: cap)
+        }
+        return ranked(hits, tokens: tokens, limit: limit)
+    }
+    static func predicate(tokens: [String], fileType: String?, after: Date?, before: Date?, nameOnly: Bool = false) -> String? {
         var clauses: [String] = []
-
         for token in tokens {
             let t = escape(token)
             guard !t.isEmpty else { continue }
-            clauses.append("(kMDItemDisplayName == \"*\(t)*\"cd || kMDItemTextContent == \"*\(t)*\"cd)")
+            clauses.append(nameOnly ? "kMDItemDisplayName == \"*\(t)*\"cd" : "(kMDItemDisplayName == \"*\(t)*\"cd || kMDItemTextContent == \"*\(t)*\"cd)")
         }
-        if let tree = contentTypeTree(for: fileType) {
-            clauses.append("kMDItemContentTypeTree == \"\(tree)\"")
+        if let tree = contentTypeTree(for: fileType) { clauses.append("kMDItemContentTypeTree == \"\(tree)\"") }
+        if let after { clauses.append("kMDItemFSContentChangeDate >= $time.iso(\(iso(after)))") }
+        if let before { clauses.append("kMDItemFSContentChangeDate <= $time.iso(\(iso(before)))") }
+        guard !clauses.isEmpty else { return nil }
+        return clauses.joined(separator: " && ")
+    }
+    static func ranked(_ hits: [Hit], tokens: [String], limit: Int) -> [Hit] {
+        var seen = Set<String>()
+        let unique = hits.filter { !JunkPath.contains($0.path) && seen.insert($0.path).inserted }
+        func score(_ hit: Hit) -> Int {
+            guard !tokens.isEmpty else { return 0 }
+            let name = hit.name.searchFolded, phrase = tokens.joined(separator: " ").searchFolded
+            if (hit.name as NSString).deletingPathExtension.searchFolded == phrase { return 100 }
+            if name.contains(phrase) { return 80 }
+            return tokens.filter { name.contains($0.searchFolded) }.count * 10
         }
-        if let after {
-            clauses.append("kMDItemFSContentChangeDate >= $time.iso(\(iso(after)))")
-        }
-        if let before {
-            clauses.append("kMDItemFSContentChangeDate <= $time.iso(\(iso(before)))")
-        }
-        // A bare "everything" query is meaningless/expensive — require at least
-        // one keyword or a type filter to anchor it.
-        guard !clauses.isEmpty, !(tokens.isEmpty && fileType == nil) else { return [] }
-
-        let queryString = clauses.joined(separator: " && ")
-        guard let query = MDQueryCreate(kCFAllocatorDefault, queryString as CFString, nil, nil) else {
-            return []
-        }
-        // Newest first, and cap the gather.
-        MDQuerySetSortComparator(query, nil, nil)
-        MDQuerySetMaxCount(query, max(limit, 1))
-        guard MDQueryExecute(query, CFOptionFlags(kMDQuerySynchronous.rawValue)) else {
-            return []
-        }
-
-        let count = MDQueryGetResultCount(query)
+        return Array(unique.sorted {
+            let a = score($0), b = score($1)
+            if a != b { return a > b }
+            if $0.modified != $1.modified { return ($0.modified ?? .distantPast) > ($1.modified ?? .distantPast) }
+            return $0.path < $1.path
+        }.prefix(max(0, limit)))
+    }
+    private static func gather(_ predicate: String, limit: Int) -> [Hit] {
+        guard let query = MDQueryCreate(kCFAllocatorDefault, predicate as CFString, nil,
+                                       [kMDItemFSContentChangeDate] as CFArray) else { return [] }
+        defer { MDQueryStop(query) }
+        MDQuerySetSortOptionFlagsForAttribute(query, kMDItemFSContentChangeDate, kMDQueryReverseSortOrderFlag.rawValue)
+        MDQuerySetMaxCount(query, limit)
+        guard MDQueryExecute(query, CFOptionFlags(kMDQuerySynchronous.rawValue)) else { return [] }
         var hits: [Hit] = []
-        hits.reserveCapacity(count)
-        for i in 0..<count {
+        for i in 0..<min(MDQueryGetResultCount(query), limit) {
             guard let raw = MDQueryGetResultAtIndex(query, i) else { continue }
             let item = unsafeBitCast(raw, to: MDItem.self)
             guard let path = MDItemCopyAttribute(item, kMDItemPath) as? String else { continue }
-            let name = (MDItemCopyAttribute(item, kMDItemDisplayName) as? String)
-                ?? (path as NSString).lastPathComponent
-            let modified = MDItemCopyAttribute(item, kMDItemFSContentChangeDate) as? Date
-            let ctype = MDItemCopyAttribute(item, kMDItemContentType) as? String
-            let kind = (MDItemCopyAttribute(item, kMDItemKind) as? String)
-                ?? (ctype == "public.folder" ? "Folder" : "File")
-            hits.append(Hit(path: path, name: name, modified: modified, contentType: ctype, kind: kind))
+            hits.append(Hit(path: path,
+                name: (MDItemCopyAttribute(item, kMDItemDisplayName) as? String) ?? (path as NSString).lastPathComponent,
+                modified: MDItemCopyAttribute(item, kMDItemFSContentChangeDate) as? Date,
+                contentType: MDItemCopyAttribute(item, kMDItemContentType) as? String,
+                kind: (MDItemCopyAttribute(item, kMDItemKind) as? String) ?? "File"))
         }
-        // MDQuery honors the sort comparator loosely; ensure newest-first.
-        return hits.sorted { ($0.modified ?? .distantPast) > ($1.modified ?? .distantPast) }
+        return hits
     }
 
     // MARK: - Helpers

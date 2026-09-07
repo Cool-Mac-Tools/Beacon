@@ -1,4 +1,5 @@
 import Foundation
+import SQLite3
 import CoreGraphics
 import ImageIO
 import UniformTypeIdentifiers
@@ -32,6 +33,44 @@ import UniformTypeIdentifiers
         expect(DocumentText.excerpt(path: document.path, query: "zebra")?.contains("zebra") == true, "read actual document excerpt")
         expect(DocumentText.excerpt(path: root.path, query: "zebra") == nil, "directories must never be read as documents")
         expect(DocumentText.centered("😀 café receipt", query: "cafe", limit: 5).contains("café"), "unicode-safe excerpt boundaries")
+        // Regression: later specific evidence beats a generic word near the start.
+        let dense = DocumentText.centered("invoice " + String(repeating: "padding ", count: 200) + "invoice zebra shipment", query: "invoice zebra shipment", limit: 180)
+        expect(dense.contains("zebra") && dense.contains("shipment"), "document excerpts prefer the most matching terms")
+        let oldHit = SpotlightFileSearch.Hit(path: "/docs/travel invoice.pdf", name: "travel invoice.pdf", modified: .distantPast, contentType: "com.adobe.pdf", kind: "PDF")
+        let recentHit = SpotlightFileSearch.Hit(path: "/docs/other.pdf", name: "other.pdf", modified: Date(), contentType: "com.adobe.pdf", kind: "PDF")
+        expect(SpotlightFileSearch.ranked([recentHit, oldHit, oldHit], tokens: ["travel", "invoice"], limit: 5).map(\.path) == [oldHit.path, recentHit.path], "old filename evidence beats recency and merged lanes deduplicate")
+        let predicate = SpotlightFileSearch.predicate(tokens: ["invoice"], fileType: "pdf", after: Date(timeIntervalSince1970: 1_700_000_000), before: nil)!
+        expect(predicate.contains("com.adobe.pdf") && predicate.contains("kMDItemFSContentChangeDate >=") && predicate.contains("kMDItemTextContent"), "type and date filters survive content retrieval")
+        expect(SpotlightFileSearch.predicate(tokens: ["invoice"], fileType: nil, after: nil, before: nil, nameOnly: true)?.contains("kMDItemTextContent") == false, "filename lane does not mix content matches")
+        expect(SpotlightFileSearch.predicate(tokens: [], fileType: nil, after: nil, before: nil) == nil, "reject unbounded Spotlight query")
+        var trace = AISearchTrace(); trace.reset(query: "invoice", generation: 4)
+        let pending = AISearchStep(title: "Search Files", state: .running)
+        trace.record(pending, generation: 4)
+        trace.record(AISearchStep(title: "Stale data"), generation: 3)
+        expect(trace.steps.count == 1, "old query callbacks cannot contaminate the log")
+        trace.record(AISearchStep(id: pending.id, title: "Search Files", detail: "2 candidates", startedAt: pending.startedAt), generation: 4)
+        expect(trace.steps.count == 1 && trace.steps[0].detail == "2 candidates", "a finished operation updates its existing row")
+        trace.record(AISearchStep(title: "Read document", state: .running), generation: 4)
+        trace.finishRunning(state: .warning, detail: "Stopped")
+        expect(!trace.steps.contains { $0.state == .running }, "cancellation leaves no indefinite spinners")
+        for _ in 0..<205 { trace.record(AISearchStep(title: "Step"), generation: 4) }
+        expect(trace.steps.count == 200, "log memory is bounded")
+        let safeLog = AISearchTraceDetails.parameters(["keywords": "invoice", "Authorization": "secret-token", "apiKey": "secret-key"])
+        expect(safeLog.contains("invoice") && !safeLog.contains("secret"), "trace uses a search-parameter whitelist")
+        // A local SQLite fixture exercises sender/date filters before the candidate cap.
+        let dbURL = root.appendingPathComponent("MailFixture.sqlite")
+        var db: OpaquePointer?
+        guard sqlite3_open(dbURL.path, &db) == SQLITE_OK else { fatalError("fixture DB") }
+        let schema = "CREATE TABLE messages (subject INTEGER, sender INTEGER, date_received REAL, snippet TEXT, deleted INTEGER); CREATE TABLE subjects (subject TEXT); CREATE TABLE addresses (address TEXT, comment TEXT); INSERT INTO subjects VALUES ('invoice from Alice'); INSERT INTO addresses VALUES ('alice@example.test', 'Alice'); INSERT INTO addresses VALUES ('bob@example.test', 'Bob');"
+        expect(sqlite3_exec(db, schema, nil, nil, nil) == SQLITE_OK, "create isolated mail fixture")
+        sqlite3_exec(db, "BEGIN", nil, nil, nil)
+        for n in 0..<550 { sqlite3_exec(db, "INSERT INTO messages VALUES (1, 2, \(1_800_000_000 + n), 'invoice', 0)", nil, nil, nil) }
+        sqlite3_exec(db, "INSERT INTO messages VALUES (1, 1, 1700000000, 'invoice', 0); COMMIT;", nil, nil, nil)
+        sqlite3_close(db)
+        let mail = MailStore(databaseURL: dbURL); mail.ensureLoaded()
+        expect(mail.search(tokens: ["invoice"], limit: 1, sender: "Alice").first?.senderAddress == "alice@example.test", "sender constraint survives hundreds of newer messages mentioning Alice")
+        expect(mail.search(tokens: ["invoice"], limit: 1, before: Date(timeIntervalSince1970: 1_750_000_000)).first?.senderAddress == "alice@example.test", "date filter runs before the SQL limit")
+        expect(mail.search(tokens: ["invoice"], limit: 1).first?.senderAddress == "bob@example.test", "filtered queries do not pollute ordinary search cache")
         if CommandLine.arguments.contains("--models") || CommandLine.arguments.contains("--text-models") {
             let resources = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("Resources")
             let tokenizer = CLIPTokenizer(url: resources.appendingPathComponent("bpe_simple_vocab_16e6.txt"))!

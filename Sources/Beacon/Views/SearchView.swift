@@ -42,27 +42,6 @@ struct SearchView: View {
     @State private var showAITips = false
     @State private var aiKeyDraft = ""
     @FocusState private var aiKeyFieldFocused: Bool
-    /// Rotating "flavor" line shown under the concrete status while the AI runs,
-    /// to keep the wait engaging.
-    @State private var aiPhraseIndex = 0
-    private let aiPhraseTimer = Timer.publish(every: 1.8, on: .main, in: .common).autoconnect()
-    /// Loading lines that reference the user's own question (built locally — no
-    /// extra model call, so zero speed cost).
-    private var aiLoadingPhrases: [String] {
-        let q = (lastAISubmitted ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !q.isEmpty else {
-            return ["Reading your request…", "Searching your Mac…",
-                    "Weighing the best matches…", "Almost there…"]
-        }
-        let short = q.count > 44 ? String(q.prefix(42)) + "…" : q
-        return [
-            "Understanding what you need…",
-            "Looking for “\(short)”…",
-            "Searching where it might live…",
-            "Weighing the best matches…",
-            "Almost there…",
-        ]
-    }
     /// "New Folder…" (from the move picker): destination + files to move in.
     @State private var newFolderParent: URL?
     @State private var newFolderSources: [URL] = []
@@ -197,6 +176,9 @@ struct SearchView: View {
             if activePreview == nil {
                 if engine.aiMode {
                     aiBanner
+                    if !engine.aiRunning, !engine.aiTrace.steps.isEmpty {
+                        AISearchTraceView(trace: engine.aiTrace, running: false, cancel: engine.cancelAIQuery)
+                    }
                 } else if engine.drillURL != nil {
                     breadcrumbBar
                 } else {
@@ -1308,26 +1290,8 @@ struct SearchView: View {
         if engine.needsFullDiskAccess {
             fullDiskAccessPrompt
         } else if engine.aiRunning {
-            // While the agent is working, always show the loading state — never
-            // any stale/leaked results underneath it.
-            VStack(spacing: 14) {
-                ProgressView().controlSize(.large)
-                Text(aiLoadingPhrases[aiPhraseIndex % aiLoadingPhrases.count])
-                    .font(.system(size: 16, weight: .semibold))
-                    .multilineTextAlignment(.center)
-                    .frame(maxWidth: 460)
-                    .id(aiPhraseIndex)
-                    .transition(.opacity)
-                if !engine.aiStatus.isEmpty {
-                    Text(engine.aiStatus)
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .onReceive(aiPhraseTimer) { _ in
-                if engine.aiRunning { withAnimation(.easeInOut(duration: 0.35)) { aiPhraseIndex += 1 } }
-            }
+            AISearchTraceView(trace: engine.aiTrace, running: true, cancel: engine.cancelAIQuery)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if !engine.results.isEmpty {
             resultsList
         } else if !engine.aiMessage.isEmpty {
@@ -1574,14 +1538,19 @@ struct SearchView: View {
             Image(systemName: "sparkles")
                 .font(.system(size: 12))
                 .foregroundStyle(Color.accentColor)
-            Text("Welcome to Beacon - press")
-                .font(.system(size: 12))
-            Text("⌥ S")
-                .font(.system(size: 11, weight: .semibold, design: .rounded))
-                .padding(.horizontal, 6).padding(.vertical, 2)
-                .background(RoundedRectangle(cornerRadius: 4).fill(Color.primary.opacity(0.08)))
-            Text("anywhere to open search. It lives in your menu bar.")
-                .font(.system(size: 12))
+            if SelfInstaller.isPreview {
+                Text("Beacon Preview — open search from the Preview icon in your menu bar.")
+                    .font(.system(size: 12))
+            } else {
+                Text("Welcome to Beacon - press")
+                    .font(.system(size: 12))
+                Text("⌥ S")
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                    .padding(.horizontal, 6).padding(.vertical, 2)
+                    .background(RoundedRectangle(cornerRadius: 4).fill(Color.primary.opacity(0.08)))
+                Text("anywhere to open search. It lives in your menu bar.")
+                    .font(.system(size: 12))
+            }
             Spacer()
             Button {
                 hasSeenWelcome = true

@@ -6,10 +6,13 @@ import AppKit
 /// just double-clicks the app in the disk image and ends up with an installed,
 /// running Beacon - no dragging or hunting through folders required.
 enum SelfInstaller {
+    /// Separate developer previews run in place and never replace an installation.
+    static var isPreview: Bool { Bundle.main.object(forInfoDictionaryKey: "BeaconDevelopmentPreview") as? Bool == true }
     /// Returns true if an install was started and the current process is about
     /// to be replaced (the caller should stop launching).
     @discardableResult
     static func installIfNeeded() -> Bool {
+        if isPreview { return false }
         let bundlePath = Bundle.main.bundlePath
 
         // Only applies to real .app bundles (not bare debug executables).
