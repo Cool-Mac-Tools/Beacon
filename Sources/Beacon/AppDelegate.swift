@@ -50,6 +50,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // copies excluded) so it's searchable under the Clipboard filter.
         ClipboardStore.shared.start()
         AISettings.shared.loadEnabledSources()
+        // Build/refresh the on-device semantic image index in the background so
+        // AI visual search can rank the whole library. No-ops if the CLIP model
+        // isn't bundled (falls back to the recent-images sweep).
+        ImageSemanticIndex.shared.start()
         Log.write("Ready. Menu-bar icon active; panel shown.")
     }
 

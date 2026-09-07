@@ -62,7 +62,7 @@ enum PhotoStore {
                 let folded = (name ?? "").searchFolded
                 guard tokens.allSatisfy({ folded.contains($0) }) else { return }
             }
-            guard let url = resolveLocalURL(for: asset),
+            guard let url = localURL(for: asset),
                   FileManager.default.fileExists(atPath: url.path) else { return }
             hits.append(Hit(url: url, name: name ?? url.lastPathComponent,
                             creationDate: asset.creationDate,
@@ -97,21 +97,25 @@ enum PhotoStore {
         PHAssetResource.assetResources(for: asset).first?.originalFilename
     }
 
-    private static func resolveLocalURL(for asset: PHAsset) -> URL? {
+    static func localURL(for asset: PHAsset) -> URL? {
         let options = PHContentEditingInputRequestOptions()
         options.isNetworkAccessAllowed = false   // local originals only; skip iCloud fetches
 
         var found: URL?
+        let resultLock = NSLock()
         let sem = DispatchSemaphore(value: 0)
-        asset.requestContentEditingInput(with: options) { input, _ in
+        let requestID = asset.requestContentEditingInput(with: options) { input, _ in
+            resultLock.lock()
             if let imageURL = input?.fullSizeImageURL {
                 found = imageURL
             } else if let av = input?.audiovisualAsset as? AVURLAsset {
                 found = av.url
             }
+            resultLock.unlock()
             sem.signal()
         }
-        _ = sem.wait(timeout: .now() + 5)
+        if sem.wait(timeout: .now() + 3) != .success { asset.cancelContentEditingInputRequest(requestID); return nil }
+        resultLock.lock(); defer { resultLock.unlock() }
         return found
     }
 }

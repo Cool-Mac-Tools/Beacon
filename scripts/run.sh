@@ -10,6 +10,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT"
 
+# Semantic search ships with a usable model; never silently package a dormant index.
+if [[ ! -d "$ROOT/Resources/MobileCLIPImage.mlmodelc" || ! -d "$ROOT/Resources/MobileCLIPText.mlmodelc" || ! -f "$ROOT/Resources/bpe_simple_vocab_16e6.txt" ]]; then
+  python3 "$ROOT/scripts/prepare-models.py"
+fi
+
 APP_NAME="Beacon"
 CONFIG="${CONFIG:-release}"
 BUILD_DIR="$ROOT/.build/$CONFIG"
@@ -59,6 +64,8 @@ if ! swift build -c "$CONFIG"; then
     -framework CoreServices \
     -framework Photos \
     -framework ImageIO \
+    -framework CoreML \
+    -framework CoreVideo \
     -lsqlite3
 fi
 
@@ -71,6 +78,14 @@ mkdir -p "$APP_BUNDLE/Contents/Frameworks"
 cp "$BUILD_DIR/$APP_NAME" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 cp "$ROOT/Resources/Info.plist" "$APP_BUNDLE/Contents/Info.plist"
 cp "$ROOT/Resources/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
+# Bundle the prepared on-device encoders, tokenizer, and license notices.
+# See Resources/CLIP-MODEL.md for model provenance and indexing coverage.
+for res in MobileCLIPImage.mlmodelc MobileCLIPText.mlmodelc bpe_simple_vocab_16e6.txt MobileCLIP-LICENSE.txt CLIP-TOKENIZER-LICENSE.txt; do
+  if [[ -e "$ROOT/Resources/$res" ]]; then
+    cp -R "$ROOT/Resources/$res" "$APP_BUNDLE/Contents/Resources/"
+    echo "==> Bundled CLIP resource: $res"
+  fi
+done
 cp -R "$ROOT/Vendor/Sparkle.framework" "$APP_BUNDLE/Contents/Frameworks/"
 printf 'APPL????' > "$APP_BUNDLE/Contents/PkgInfo"
 

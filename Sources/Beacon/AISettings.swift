@@ -102,7 +102,7 @@ final class AISettings: ObservableObject {
     private let defaults = UserDefaults.standard
     private let providerKey = "beacon.ai.provider"
     private let sourcesKey = "beacon.ai.enabledSources"
-    private let disclosedKey = "beacon.ai.privacyDisclosed"
+    private let disclosedKey = "beacon.ai.privacyDisclosed.v2"
     private func modelKey(_ p: Provider) -> String { "beacon.ai.model.\(p.rawValue)" }
     private func keyKey(_ p: Provider) -> String { "beacon.ai.key.\(p.rawValue).b64" }
     // Pre-multi-provider builds stored a single OpenAI key/model here.

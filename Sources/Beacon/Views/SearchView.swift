@@ -1,4 +1,5 @@
 import SwiftUI
+import Photos
 import AppKit
 
 struct SearchView: View {
@@ -7,6 +8,7 @@ struct SearchView: View {
     @ObservedObject private var refinementLayout = RefinementLayoutStore.shared
     @ObservedObject private var license = LicenseStore.shared
     @ObservedObject private var aiSettings = AISettings.shared
+    @ObservedObject private var imageIndex = ImageSemanticIndex.shared
     let onClose: () -> Void
     let onEditingChanged: (Bool) -> Void
     let onRefinementSidebarChanged: (Bool) -> Void
@@ -1328,6 +1330,34 @@ struct SearchView: View {
             }
         } else if !engine.results.isEmpty {
             resultsList
+        } else if !engine.aiMessage.isEmpty {
+            // A run finished with no results (or errored). Show a clear terminal
+            // message with a retry — never silently revert to the blank invite.
+            VStack(spacing: 12) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 30, weight: .regular))
+                    .foregroundStyle(.secondary)
+                Text(engine.aiMessage)
+                    .font(.system(size: 15, weight: .semibold))
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 440)
+                if let last = lastAISubmitted, !last.isEmpty {
+                    Text("“\(last)”")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 440)
+                    Button {
+                        engine.runAIQuery(last)
+                    } label: {
+                        Label("Try again", systemImage: "arrow.clockwise")
+                    }
+                    .buttonStyle(.bordered)
+                    .padding(.top, 2)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding(24)
         } else {
             VStack(spacing: 12) {
                 Image(systemName: "sparkles")
@@ -1907,180 +1937,247 @@ struct SearchView: View {
 
     /// In-panel AI settings: paste key (with a clear saved state), pick a model
     /// with capability/cost notes, and choose which sources the AI may search.
+    /// AI settings as a full-window PAGE (not a dark-scrim popup): an opaque
+    /// system-background screen with a header bar, scrolling content, and a
+    /// footer bar — it takes over the whole panel like its own tab.
     private var aiSettingsPanel: some View {
-        ZStack {
-            Color.black.opacity(0.32).ignoresSafeArea()
-                .onTapGesture { showAISettingsPanel = false }
-            VStack(alignment: .leading, spacing: 18) {
-                HStack {
-                    Label("AI settings", systemImage: "sparkles")
-                        .font(.system(size: 16, weight: .semibold))
-                    Spacer()
-                    Button { showAISettingsPanel = false } label: {
-                        Image(systemName: "xmark").font(.system(size: 12, weight: .semibold))
-                    }
-                    .buttonStyle(.plain).foregroundStyle(.secondary)
+        VStack(spacing: 0) {
+            // Header / nav bar — a back chevron returns to search.
+            HStack(spacing: 10) {
+                Button { showAISettingsPanel = false } label: {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 28, height: 28)
+                        .contentShape(Rectangle())
                 }
-
-                // Provider tabs — the selected one is the active provider used
-                // for queries. Each keeps its own key + model.
-                providerTabs
-
-                let provider = aiSettings.provider
-
-                // API key (per provider)
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack {
-                        Text("\(provider.displayName) API key")
-                            .font(.system(size: 12, weight: .semibold))
-                        Spacer()
-                        if aiSettings.hasKey(for: provider) {
-                            Label("Key saved", systemImage: "checkmark.circle.fill")
-                                .font(.system(size: 11, weight: .medium))
-                                .foregroundStyle(.green)
-                        } else {
-                            Link(destination: provider.keyURL) {
-                                Label("Get a key", systemImage: "arrow.up.right.square")
-                                    .font(.system(size: 11, weight: .medium))
-                            }
-                        }
-                    }
-                    HStack(spacing: 8) {
-                        SecureField(aiSettings.hasKey(for: provider)
-                                    ? "•••••••• (saved) — paste to replace" : provider.keyPlaceholder,
-                                    text: $aiKeyDraft)
-                            .textFieldStyle(.roundedBorder)
-                            .focused($aiKeyFieldFocused)
-                            .onSubmit { saveAIKey() }
-                        Button("Save") { saveAIKey() }
-                            .buttonStyle(.borderedProminent)
-                            .disabled(aiKeyDraft.trimmingCharacters(in: .whitespaces).isEmpty)
-                        if aiSettings.hasKey(for: provider) {
-                            Button("Remove") {
-                                aiSettings.setKey(nil, for: provider)
-                                aiKeyDraft = ""
-                            }
-                        }
-                    }
-                    Text("Your key stays on this Mac and is sent only to \(provider.displayName). You're billed by \(provider.displayName) for your own usage.")
-                        .font(.system(size: 10)).foregroundStyle(.tertiary)
-                }
-
-                // Model picker (per provider). Scrolls when a provider offers a
-                // long lineup so the panel stays compact.
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Model").font(.system(size: 12, weight: .semibold))
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 2) {
-                            ForEach(provider.models, id: \.self) { m in
-                                let selected = aiSettings.model(for: provider) == m
-                                Button { aiSettings.setModel(m, for: provider) } label: {
-                                    HStack(spacing: 10) {
-                                        Image(systemName: selected ? "largecircle.fill.circle" : "circle")
-                                            .foregroundStyle(selected ? Color.accentColor : .secondary)
-                                        VStack(alignment: .leading, spacing: 1) {
-                                            Text(m).font(.system(size: 13, weight: .medium))
-                                            Text(provider.blurb(for: m))
-                                                .font(.system(size: 11)).foregroundStyle(.secondary)
-                                        }
-                                        Spacer()
-                                    }
-                                    .padding(.horizontal, 10).padding(.vertical, 7)
-                                    .background(RoundedRectangle(cornerRadius: 9)
-                                        .fill(selected ? Color.accentColor.opacity(0.10) : .clear))
-                                    .contentShape(Rectangle())
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
-                    }
-                    .frame(maxHeight: 172)
-                }
-
-                // Sources
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Sources the AI may search").font(.system(size: 12, weight: .semibold))
-                    LazyVGrid(columns: [GridItem(.flexible(), alignment: .leading),
-                                        GridItem(.flexible(), alignment: .leading)],
-                              spacing: 4) {
-                        ForEach(AISource.allCases) { source in
-                            Toggle(isOn: sourceBinding(source)) {
-                                Text(source.displayName).font(.system(size: 12))
-                            }
-                            .toggleStyle(.checkbox)
-                        }
-                    }
-                    Text("Messages & Mail need Full Disk Access.")
-                        .font(.system(size: 10)).foregroundStyle(.tertiary)
-                }
-
-                HStack {
-                    Spacer()
-                    Button("Done") { showAISettingsPanel = false }
-                        .keyboardShortcut(.defaultAction)
-                        .buttonStyle(.borderedProminent)
-                }
+                .buttonStyle(.plain)
+                .help("Back to search")
+                Image(systemName: "sparkles")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(Color.accentColor)
+                Text("AI settings")
+                    .font(.system(size: 15, weight: .semibold))
+                Spacer()
             }
-            .padding(24)
-            .frame(width: 460)
-            .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(.regularMaterial))
-            .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.12)))
-            .shadow(radius: 24, y: 8)
+            .padding(.horizontal, 14)
+            .frame(height: 52)
+
+            glassDivider
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 26) {
+                    // Provider tabs — the selected one is the active provider
+                    // used for queries. Each keeps its own key + model.
+                    providerTabs
+                    aiKeySection
+                    aiModelSection
+                    aiSourcesSection
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Find older images").font(.headline)
+                        Toggle("Index images on this Mac", isOn: Binding(
+                            get: { imageIndex.isEnabled }, set: { imageIndex.setEnabled($0) }))
+                        Text(imageIndex.status).font(.caption).foregroundStyle(.secondary)
+                        Text("Matches descriptions to image content locally, then AI checks the best candidates. Covers Desktop, Downloads, Documents, Pictures, Movies, and authorized local Photos originals. Cloud-only originals are skipped.")
+                            .font(.caption).foregroundStyle(.secondary)
+                        HStack {
+                            Button("Refresh index") { imageIndex.refresh() }.disabled(!imageIndex.isEnabled)
+                            Button("Connect Photos") {
+                                PHPhotoLibrary.requestAuthorization(for: .readWrite) { _ in imageIndex.refresh() }
+                            }
+                        }
+                    }
+                }
+                .padding(.horizontal, 28)
+                .padding(.vertical, 26)
+                .frame(maxWidth: 600, alignment: .leading)
+                .frame(maxWidth: .infinity)
+            }
+
+            glassDivider
+
+            // Footer bar.
+            HStack {
+                Spacer()
+                Button("Done") { showAISettingsPanel = false }
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
+            }
+            .padding(.horizontal, 20)
+            .frame(height: 52)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(nsColor: .windowBackgroundColor))
+        .clipShape(panelShape)
         .onExitCommand { showAISettingsPanel = false }
         .onAppear { aiKeyFieldFocused = true }
     }
 
-    /// Best-practices card for AI mode — the more specific the prompt, the faster
-    /// and more accurate the result, because each detail becomes a hard filter.
-    private var aiTipsOverlay: some View {
-        ZStack {
-            Color.black.opacity(0.32).ignoresSafeArea()
-                .onTapGesture { showAITips = false }
-            VStack(alignment: .leading, spacing: 16) {
-                HStack {
-                    Label("Tips for great results", systemImage: "lightbulb.fill")
-                        .font(.system(size: 16, weight: .semibold))
-                    Spacer()
-                    Button { showAITips = false } label: {
-                        Image(systemName: "xmark").font(.system(size: 12, weight: .semibold))
+    // API key entry for the active provider.
+    private var aiKeySection: some View {
+        let provider = aiSettings.provider
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("\(provider.displayName) API key")
+                    .font(.system(size: 13, weight: .semibold))
+                Spacer()
+                if aiSettings.hasKey(for: provider) {
+                    Label("Key saved", systemImage: "checkmark.circle.fill")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.green)
+                } else {
+                    Link(destination: provider.keyURL) {
+                        Label("Get a key", systemImage: "arrow.up.right.square")
+                            .font(.system(size: 11, weight: .medium))
                     }
-                    .buttonStyle(.plain).foregroundStyle(.secondary)
-                }
-                Text("The more specific you are, the faster and sharper the answer — every detail becomes a filter Beacon can use.")
-                    .font(.system(size: 12)).foregroundStyle(.secondary)
-
-                VStack(alignment: .leading, spacing: 10) {
-                    aiTipRow("person.crop.circle", "Name the person", "Who sent or made it — “from Sean M”.")
-                    aiTipRow("tray.full", "Say where it lives", "A message, an email, a note, a file, an image, a PDF…")
-                    aiTipRow("calendar", "Give a time frame", "Exact (“between May 20 and June 1”) or rough (“about 2 months ago”).")
-                    aiTipRow("text.magnifyingglass", "Describe the content", "Words in or around it, or what an image shows.")
-                }
-
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Example").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
-                    Text("“Find the email & password Sean M sent me in Messages between May 20 and June 1.”")
-                        .font(.system(size: 12, weight: .medium))
-                        .padding(10)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(RoundedRectangle(cornerRadius: 9).fill(Color.accentColor.opacity(0.10)))
-                }
-
-                HStack {
-                    Spacer()
-                    Button("Got it") { showAITips = false }
-                        .keyboardShortcut(.defaultAction)
-                        .buttonStyle(.borderedProminent)
                 }
             }
-            .padding(24)
-            .frame(width: 440)
-            .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(.regularMaterial))
-            .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.12)))
-            .shadow(radius: 24, y: 8)
+            HStack(spacing: 8) {
+                SecureField(aiSettings.hasKey(for: provider)
+                            ? "•••••••• (saved) — paste to replace" : provider.keyPlaceholder,
+                            text: $aiKeyDraft)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($aiKeyFieldFocused)
+                    .onSubmit { saveAIKey() }
+                Button("Save") { saveAIKey() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(aiKeyDraft.trimmingCharacters(in: .whitespaces).isEmpty)
+                if aiSettings.hasKey(for: provider) {
+                    Button("Remove") {
+                        aiSettings.setKey(nil, for: provider)
+                        aiKeyDraft = ""
+                    }
+                }
+            }
+            Text("Your key stays on this Mac and is sent only to \(provider.displayName). You're billed by \(provider.displayName) for your own usage.")
+                .font(.system(size: 11)).foregroundStyle(.secondary)
         }
+    }
+
+    // Model radio list for the active provider. On a full page there's room to
+    // show the whole lineup inline; the page itself scrolls.
+    private var aiModelSection: some View {
+        let provider = aiSettings.provider
+        return VStack(alignment: .leading, spacing: 8) {
+            Text("Model").font(.system(size: 13, weight: .semibold))
+            VStack(alignment: .leading, spacing: 2) {
+                ForEach(provider.models, id: \.self) { m in
+                    let selected = aiSettings.model(for: provider) == m
+                    Button { aiSettings.setModel(m, for: provider) } label: {
+                        HStack(spacing: 10) {
+                            Image(systemName: selected ? "largecircle.fill.circle" : "circle")
+                                .foregroundStyle(selected ? Color.accentColor : .secondary)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(m).font(.system(size: 13, weight: .medium))
+                                Text(provider.blurb(for: m))
+                                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                        }
+                        .padding(.horizontal, 10).padding(.vertical, 8)
+                        .background(RoundedRectangle(cornerRadius: 9)
+                            .fill(selected ? Color.accentColor.opacity(0.10) : .clear))
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+
+    // Which of the user's sources the AI is allowed to search.
+    private var aiSourcesSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Sources the AI may search").font(.system(size: 13, weight: .semibold))
+            LazyVGrid(columns: [GridItem(.flexible(), alignment: .leading),
+                                GridItem(.flexible(), alignment: .leading)],
+                      spacing: 6) {
+                ForEach(AISource.allCases) { source in
+                    Toggle(isOn: sourceBinding(source)) {
+                        Text(source.displayName).font(.system(size: 12))
+                    }
+                    .toggleStyle(.checkbox)
+                }
+            }
+            Text("Messages & Mail need Full Disk Access.")
+                .font(.system(size: 11)).foregroundStyle(.secondary)
+        }
+    }
+
+    /// Best-practices card for AI mode — the more specific the prompt, the faster
+    /// and more accurate the result, because each detail becomes a hard filter.
+    /// Tips as a full-window PAGE (matching the AI settings page) — an opaque
+    /// system-background screen with a header bar, content, and a footer bar,
+    /// not a dark-scrim popup.
+    private var aiTipsOverlay: some View {
+        VStack(spacing: 0) {
+            // Header / nav bar — a back chevron returns to search.
+            HStack(spacing: 10) {
+                Button { showAITips = false } label: {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 28, height: 28)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Back to search")
+                Image(systemName: "lightbulb.fill")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(Color.accentColor)
+                Text("Tips for great results")
+                    .font(.system(size: 15, weight: .semibold))
+                Spacer()
+            }
+            .padding(.horizontal, 14)
+            .frame(height: 52)
+
+            glassDivider
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    Text("The more specific you are, the faster and sharper the answer — every detail becomes a filter Beacon can use.")
+                        .font(.system(size: 13)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    VStack(alignment: .leading, spacing: 14) {
+                        aiTipRow("person.crop.circle", "Name the person", "Who sent or made it — “from Sean M”.")
+                        aiTipRow("tray.full", "Say where it lives", "A message, an email, a note, a file, an image, a PDF…")
+                        aiTipRow("calendar", "Give a time frame", "Exact (“between May 20 and June 1”) or rough (“about 2 months ago”).")
+                        aiTipRow("text.magnifyingglass", "Describe the content", "Words in or around it, or what an image shows.")
+                    }
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Example").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
+                        Text("“Find the email & password Sean M sent me in Messages between May 20 and June 1.”")
+                            .font(.system(size: 13, weight: .medium))
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(12)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(RoundedRectangle(cornerRadius: 10).fill(Color.accentColor.opacity(0.10)))
+                    }
+                }
+                .padding(.horizontal, 28)
+                .padding(.vertical, 26)
+                .frame(maxWidth: 600, alignment: .leading)
+                .frame(maxWidth: .infinity)
+            }
+
+            glassDivider
+
+            // Footer bar.
+            HStack {
+                Spacer()
+                Button("Got it") { showAITips = false }
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
+            }
+            .padding(.horizontal, 20)
+            .frame(height: 52)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(nsColor: .windowBackgroundColor))
+        .clipShape(panelShape)
         .onExitCommand { showAITips = false }
     }
 
@@ -2474,7 +2571,7 @@ struct SearchView: View {
                 Text("Turn on AI mode?")
                     .font(.system(size: 18, weight: .semibold))
                 Text("AI mode uses your own AI provider and API key. When you ask "
-                     + "a question, matched snippets from the sources you enable "
+                     + "a question, matched snippets, document excerpts, and selected image thumbnails from the sources you enable "
                      + "are sent to that provider under your account to find your "
                      + "results. Normal Beacon search stays fully local. You can "
                      + "turn this off anytime.")

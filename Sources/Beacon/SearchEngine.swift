@@ -601,6 +601,7 @@ final class SearchEngine: ObservableObject {
             bumpAIGeneration()
             aiRunning = false
             aiStatus = ""
+            aiMessage = ""
             if aiMode {
                 // Entering AI mode: stop any in-flight normal search so its async
                 // callbacks can't republish files into the list.
@@ -621,6 +622,11 @@ final class SearchEngine: ObservableObject {
         }
     }
     @Published private(set) var aiStatus: String = ""
+    /// A terminal, persistent message shown after a run ends with no results —
+    /// "No matches found", a key/connection error, etc. Unlike `aiStatus` (a
+    /// live progress line that vanishes when the run stops), this survives so an
+    /// empty/failed run never silently reverts to the blank "ask" invite.
+    @Published private(set) var aiMessage: String = ""
     @Published private(set) var aiRunning: Bool = false
     /// Serial queue for the AI agent loop so tool searches don't race the
     /// normal (mode-off) search path, which shares the same store instances.
@@ -1451,8 +1457,12 @@ final class SearchEngine: ObservableObject {
         case .folders:
             return Array(dated(folderStore.search(tokens: tokens, limit: wide).map { SearchResult(folder: $0) }).prefix(limit))
         case .files:
-            let ft0 = fileType?.lowercased() ?? ""
-            let isMedia = ["image", "images", "photo", "photos", "video", "videos", "movie"].contains(ft0)
+            // Robust media detection (handles "picture"/"screenshot"/"clip"/…,
+            // not just a fixed few words) so keyword-drop, PhotoKit gathering,
+            // and the Spotlight type filter all agree.
+            let mediaKind = AIMediaKind.classify(fileType)
+            let isMedia = mediaKind != nil
+            let canonicalFileType = mediaKind?.canonical ?? fileType
             // For visual media the user's keywords describe what the picture
             // SHOWS, not its filename — matching them against names (IMG_1234)
             // would exclude the very photos vision needs to inspect. Gather the
@@ -1461,7 +1471,7 @@ final class SearchEngine: ObservableObject {
             let fileTokens = isMedia ? [] : tokens
             // Full-disk Spotlight (MDQuery) — finds files beyond the recents
             // window, hard-filtered by type + date in the query itself.
-            let hits = SpotlightFileSearch.search(tokens: fileTokens, fileType: fileType,
+            let hits = SpotlightFileSearch.search(tokens: fileTokens, fileType: canonicalFileType,
                                                   after: after, before: before, limit: wide)
             var rows: [SearchResult] = hits.map { hit in
                 SearchResult(id: hit.path, name: hit.name, path: hit.path,
@@ -1475,8 +1485,8 @@ final class SearchEngine: ObservableObject {
             // Photo library (PhotoKit) — Spotlight doesn't index inside the
             // .photoslibrary package, so pull image/video assets directly when
             // the query is media-oriented, and merge by real on-disk path.
-            let wantImage = ["image", "images", "photo", "photos"].contains(ft0)
-            let wantVideo = ["video", "videos", "movie"].contains(ft0)
+            let wantImage = mediaKind == .image
+            let wantVideo = mediaKind == .video
             if wantImage || wantVideo {
                 var seen = Set(rows.map(\.path))
                 for h in PhotoStore.search(wantImage: wantImage, wantVideo: wantVideo,
@@ -1546,6 +1556,26 @@ final class SearchEngine: ObservableObject {
         }
     }
 
+    /// Whole-library semantic image candidates for a visual query, best-match
+    /// first, via the on-device CLIP index. Empty when the index isn't available
+    /// (no model bundled / not yet built) — callers then fall back to the
+    /// recent-images sweep. Runs on aiQueue.
+    func aiSemanticImageResults(description: String, limit: Int, after: Date? = nil, before: Date? = nil) -> [SearchResult] {
+        let paths = ImageSemanticIndex.shared.topPaths(matching: description, limit: limit, after: after, before: before)
+        guard !paths.isEmpty else { return [] }
+        let fm = FileManager.default
+        return paths.compactMap { path in
+            guard fm.fileExists(atPath: path) else { return nil }
+            let url = URL(fileURLWithPath: path)
+            let mod = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
+                .contentModificationDate
+            return SearchResult(id: path, name: url.lastPathComponent, path: path,
+                                kind: "Image", size: nil, modified: mod, lastUsed: nil,
+                                dateAdded: mod, isFolder: false, isApp: false,
+                                contentTypes: ["public.image"], matchKind: .name)
+        }
+    }
+
     func aiSetStatus(_ text: String, generation: Int) {
         DispatchQueue.main.async {
             guard self.aiIsCurrent(generation) else { return }
@@ -1585,7 +1615,7 @@ final class SearchEngine: ObservableObject {
 
     /// Publish the AI-chosen locations, preserving the agent's ranking order
     /// (no relevance re-sort, unlike normal search).
-    func aiPublish(_ rows: [SearchResult], generation: Int) {
+    func aiPublish(_ rows: [SearchResult], generation: Int, emptyMessage: String? = nil) {
         DispatchQueue.main.async {
             // A superseded run (user re-submitted, toggled AI off, or started a
             // new query) must not overwrite the current results/state.
@@ -1597,6 +1627,10 @@ final class SearchEngine: ObservableObject {
             self.canLoadMore = false
             self.isShowingStaleResults = false
             self.results = deduped
+            // Show a terminal message only when there's nothing to display, so a
+            // finished-but-empty run reads as "no matches" rather than the blank
+            // invite. Any results clear it.
+            self.aiMessage = deduped.isEmpty ? (emptyMessage ?? "") : ""
         }
     }
 
@@ -1610,6 +1644,7 @@ final class SearchEngine: ObservableObject {
         let gen = bumpAIGeneration()
         aiRunning = true
         aiStatus = "Thinking…"
+        aiMessage = ""
         isSearching = true
         results = []
         aiQueue.async { [weak self] in
