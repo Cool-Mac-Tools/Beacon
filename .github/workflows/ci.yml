@@ -1,0 +1,23 @@
+name: macOS build and tests
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build-test:
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: swift build
+      - run: swift test
+      - run: bash scripts/test-semantic.sh
+      - name: Prepare pinned image models
+        run: python3 scripts/prepare-models.py
+      - name: Exercise actual encoders
+        run: bash scripts/test-semantic.sh --models

@@ -16,3 +16,7 @@ dist/
 *.xcworkspace/xcuserdata/
 DerivedData/
 .wrangler/
+
+# Generated from pinned, checksummed Apple models by scripts/prepare-models.py.
+Resources/*.mlmodelc/
+Resources/bpe_simple_vocab_16e6.txt

@@ -601,6 +601,8 @@ final class SearchEngine: ObservableObject {
             bumpAIGeneration()
             aiRunning = false
             aiStatus = ""
+            aiMessage = ""
+            aiTrace.reset(query: "", generation: _aiGeneration)
             if aiMode {
                 // Entering AI mode: stop any in-flight normal search so its async
                 // callbacks can't republish files into the list.
@@ -621,7 +623,13 @@ final class SearchEngine: ObservableObject {
         }
     }
     @Published private(set) var aiStatus: String = ""
+    /// A terminal, persistent message shown after a run ends with no results —
+    /// "No matches found", a key/connection error, etc. Unlike `aiStatus` (a
+    /// live progress line that vanishes when the run stops), this survives so an
+    /// empty/failed run never silently reverts to the blank "ask" invite.
+    @Published private(set) var aiMessage: String = ""
     @Published private(set) var aiRunning: Bool = false
+    @Published private(set) var aiTrace = AISearchTrace()
     /// Serial queue for the AI agent loop so tool searches don't race the
     /// normal (mode-off) search path, which shares the same store instances.
     private let aiQueue = DispatchQueue(label: "com.beacon.ai", qos: .userInitiated)
@@ -1382,7 +1390,7 @@ final class SearchEngine: ObservableObject {
     /// the AI layer uses to reach Beacon's otherwise-private stores.
     func aiToolSearch(_ source: AISource, tokens: [String], limit: Int,
                       from: String? = nil, after: Date? = nil, before: Date? = nil,
-                      fileType: String? = nil) -> [SearchResult] {
+                      fileType: String? = nil, report: (String) -> Void = { _ in }) -> [SearchResult] {
         // Allow a filter-only search (no keywords) — e.g. "images from ~May".
         guard !tokens.isEmpty || from != nil || after != nil || before != nil || fileType != nil else {
             return []
@@ -1427,7 +1435,7 @@ final class SearchEngine: ObservableObject {
             return mailQueue.sync {
                 mailStore.ensureLoaded()
                 guard !mailStore.needsFullDiskAccess else { return [] }
-                return Array(dated(mailStore.search(tokens: tokens, limit: wide).map { SearchResult(mail: $0) }).prefix(limit))
+                return Array(dated(mailStore.search(tokens: tokens, limit: wide, sender: from, after: after, before: before).map { SearchResult(mail: $0) }).prefix(limit))
             }
         case .notes:
             return notesQueue.sync {
@@ -1451,8 +1459,12 @@ final class SearchEngine: ObservableObject {
         case .folders:
             return Array(dated(folderStore.search(tokens: tokens, limit: wide).map { SearchResult(folder: $0) }).prefix(limit))
         case .files:
-            let ft0 = fileType?.lowercased() ?? ""
-            let isMedia = ["image", "images", "photo", "photos", "video", "videos", "movie"].contains(ft0)
+            // Robust media detection (handles "picture"/"screenshot"/"clip"/…,
+            // not just a fixed few words) so keyword-drop, PhotoKit gathering,
+            // and the Spotlight type filter all agree.
+            let mediaKind = AIMediaKind.classify(fileType)
+            let isMedia = mediaKind != nil
+            let canonicalFileType = mediaKind?.canonical ?? fileType
             // For visual media the user's keywords describe what the picture
             // SHOWS, not its filename — matching them against names (IMG_1234)
             // would exclude the very photos vision needs to inspect. Gather the
@@ -1461,8 +1473,8 @@ final class SearchEngine: ObservableObject {
             let fileTokens = isMedia ? [] : tokens
             // Full-disk Spotlight (MDQuery) — finds files beyond the recents
             // window, hard-filtered by type + date in the query itself.
-            let hits = SpotlightFileSearch.search(tokens: fileTokens, fileType: fileType,
-                                                  after: after, before: before, limit: wide)
+            let hits = SpotlightFileSearch.search(tokens: fileTokens, fileType: canonicalFileType,
+                                                  after: after, before: before, limit: wide, report: report)
             var rows: [SearchResult] = hits.map { hit in
                 SearchResult(id: hit.path, name: hit.name, path: hit.path,
                              kind: hit.kind, size: nil,
@@ -1475,8 +1487,8 @@ final class SearchEngine: ObservableObject {
             // Photo library (PhotoKit) — Spotlight doesn't index inside the
             // .photoslibrary package, so pull image/video assets directly when
             // the query is media-oriented, and merge by real on-disk path.
-            let wantImage = ["image", "images", "photo", "photos"].contains(ft0)
-            let wantVideo = ["video", "videos", "movie"].contains(ft0)
+            let wantImage = mediaKind == .image
+            let wantVideo = mediaKind == .video
             if wantImage || wantVideo {
                 var seen = Set(rows.map(\.path))
                 for h in PhotoStore.search(wantImage: wantImage, wantVideo: wantVideo,
@@ -1546,6 +1558,40 @@ final class SearchEngine: ObservableObject {
         }
     }
 
+    /// Whole-library semantic image candidates for a visual query, best-match
+    /// first, via the on-device CLIP index. Empty when the index isn't available
+    /// (no model bundled / not yet built) — callers then fall back to the
+    /// recent-images sweep. Runs on aiQueue.
+    func aiSemanticImageResults(description: String, limit: Int, after: Date? = nil, before: Date? = nil) -> [SearchResult] {
+        let paths = ImageSemanticIndex.shared.topPaths(matching: description, limit: limit, after: after, before: before)
+        guard !paths.isEmpty else { return [] }
+        let fm = FileManager.default
+        return paths.compactMap { path in
+            guard fm.fileExists(atPath: path) else { return nil }
+            let url = URL(fileURLWithPath: path)
+            let mod = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
+                .contentModificationDate
+            return SearchResult(id: path, name: url.lastPathComponent, path: path,
+                                kind: "Image", size: nil, modified: mod, lastUsed: nil,
+                                dateAdded: mod, isFolder: false, isApp: false,
+                                contentTypes: ["public.image"], matchKind: .name)
+        }
+    }
+
+    func aiRecord(_ step: AISearchStep, generation: Int) {
+        DispatchQueue.main.async {
+            guard self.aiIsCurrent(generation) else { return }
+            self.aiTrace.record(step, generation: generation)
+        }
+    }
+    func cancelAIQuery() {
+        guard aiRunning else { return }
+        bumpAIGeneration()
+        aiTrace.finishRunning(state: .warning, detail: "Stopped by you")
+        aiRunning = false; isSearching = false; aiStatus = ""
+        aiMessage = "Search stopped. You can inspect its steps or try a more specific query."
+    }
+
     func aiSetStatus(_ text: String, generation: Int) {
         DispatchQueue.main.async {
             guard self.aiIsCurrent(generation) else { return }
@@ -1558,7 +1604,7 @@ final class SearchEngine: ObservableObject {
     /// granted. A single locked source no longer walls the whole query — the AI
     /// searches the rest. Only when *every* enabled source is blocked do we
     /// surface the Full Disk Access prompt. Runs on aiQueue.
-    func aiUsableSources(_ sources: [AISource]) -> [AISource] {
+    func aiUsableSources(_ sources: [AISource], generation: Int? = nil) -> [AISource] {
         var blocked: Set<AISource> = []
         // Probe each store on its own queue so this (running on aiQueue) can't
         // race a normal-path load/search of the same store.
@@ -1574,29 +1620,35 @@ final class SearchEngine: ObservableObject {
         let usable = sources.filter { !blocked.contains($0) }
         let allBlocked = usable.isEmpty && !blocked.isEmpty
         DispatchQueue.main.async {
+            if let generation, !self.aiIsCurrent(generation) { return }
             self.needsFullDiskAccess = allBlocked
-            if allBlocked, let url = URL(string:
-                "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
-                NSWorkspace.shared.open(url)
-            }
         }
         return usable
     }
 
     /// Publish the AI-chosen locations, preserving the agent's ranking order
     /// (no relevance re-sort, unlike normal search).
-    func aiPublish(_ rows: [SearchResult], generation: Int) {
+    func aiPublish(_ rows: [SearchResult], generation: Int, emptyMessage: String? = nil) {
         DispatchQueue.main.async {
             // A superseded run (user re-submitted, toggled AI off, or started a
             // new query) must not overwrite the current results/state.
             guard self.aiIsCurrent(generation) else { return }
             var seen = Set<String>()
             let deduped = rows.filter { seen.insert($0.id).inserted }
+            self.aiTrace.finishRunning(state: .complete, detail: "")
+            self.aiTrace.record(AISearchStep(title: rows.isEmpty ? "Search finished without results" : "Selected \(deduped.count) results",
+                detail: rows.isEmpty ? (emptyMessage ?? "No matches") : deduped.prefix(12).map { $0.name }.joined(separator: "\n"),
+                state: rows.isEmpty ? .warning : .complete), generation: generation)
             self.aiRunning = false
+            self.aiStatus = ""
             self.isSearching = false
             self.canLoadMore = false
             self.isShowingStaleResults = false
             self.results = deduped
+            // Show a terminal message only when there's nothing to display, so a
+            // finished-but-empty run reads as "no matches" rather than the blank
+            // invite. Any results clear it.
+            self.aiMessage = deduped.isEmpty ? (emptyMessage ?? "") : ""
         }
     }
 
@@ -1608,8 +1660,10 @@ final class SearchEngine: ObservableObject {
         // Supersede any in-flight run: a new generation invalidates the old one,
         // which will notice and bail before it publishes over these results.
         let gen = bumpAIGeneration()
+        aiTrace.reset(query: trimmed, generation: gen)
         aiRunning = true
-        aiStatus = "Thinking…"
+        aiStatus = "Checking connected sources…"
+        aiMessage = ""
         isSearching = true
         results = []
         aiQueue.async { [weak self] in

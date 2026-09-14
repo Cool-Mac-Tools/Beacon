@@ -11,7 +11,7 @@
 #
 # Usage:
 #   bash scripts/release.sh [version]            # build + notarize + staple dmg
-#   bash scripts/release.sh 0.1.0 --publish      # also create a GitHub Release
+#   bash scripts/release.sh 1.1.0 --publish      # publish release, then update site/feed
 #
 # Env overrides:
 #   NOTARY_PROFILE   keychain profile name (default: beacon-notary)
@@ -22,6 +22,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT"
+
+# Semantic search ships with a usable model; never silently package a dormant index.
+if [[ ! -d "$ROOT/Resources/MobileCLIPImage.mlmodelc" || ! -d "$ROOT/Resources/MobileCLIPText.mlmodelc" || ! -f "$ROOT/Resources/bpe_simple_vocab_16e6.txt" ]]; then
+  python3 "$ROOT/scripts/prepare-models.py"
+fi
 
 APP_NAME="Beacon"
 NOTARY_PROFILE="${NOTARY_PROFILE:-beacon-notary}"
@@ -34,6 +39,26 @@ for arg in "$@"; do
 done
 if [ -z "$VERSION" ] || [ "$VERSION" = "--publish" ]; then
   VERSION="$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' Resources/Info.plist 2>/dev/null || echo "0.1.0")"
+fi
+
+# The filename, bundled version, update feed, and release tag must agree.
+PLIST_VERSION="$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' Resources/Info.plist)"
+if [[ "$VERSION" != "$PLIST_VERSION" ]]; then
+  echo "ERROR: version $VERSION does not match Resources/Info.plist ($PLIST_VERSION)." >&2
+  exit 1
+fi
+if [[ "$PUBLISH" == "true" ]]; then
+  [[ "$(git branch --show-current)" == "main" && -z "$(git status --porcelain)" ]] || {
+    echo "ERROR: publish from a clean main branch." >&2; exit 1;
+  }
+  git fetch origin main
+  [[ "$(git rev-parse HEAD)" == "$(git rev-parse origin/main)" ]] || {
+    echo "ERROR: local main must match origin/main before publishing." >&2; exit 1;
+  }
+  if gh release view "v$VERSION" >/dev/null 2>&1; then
+    echo "ERROR: v$VERSION already exists; use a new version instead of replacing a release." >&2
+    exit 1
+  fi
 fi
 
 # --- License-enforcement preflight -----------------------------------------
@@ -94,7 +119,11 @@ fi
 
 # --- Build ------------------------------------------------------------------
 echo "==> Building $APP_NAME $VERSION (release)..."
-if ! swift build -c release; then
+# Some managed hosts already sandbox this process and cannot nest SwiftPM's
+# manifest sandbox. Normal developer builds retain SwiftPM's default sandbox.
+SPM_FLAGS=(--cache-path "$PWD/.build/spm-cache")
+if [[ "${SWIFTPM_DISABLE_SANDBOX:-0}" == "1" ]]; then SPM_FLAGS+=(--disable-sandbox); fi
+if ! swift build -c release "${SPM_FLAGS[@]}"; then
   echo "==> SwiftPM unavailable; compiling directly with swiftc..."
   mkdir -p "$BUILD_DIR"
   SOURCE_FILES=()
@@ -122,6 +151,8 @@ if ! swift build -c release; then
     -framework CoreServices \
     -framework Photos \
     -framework ImageIO \
+    -framework CoreML \
+    -framework CoreVideo \
     -lsqlite3
 fi
 
@@ -132,6 +163,13 @@ mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources" \
 cp "$BUILD_DIR/$APP_NAME" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 cp "$ROOT/Resources/Info.plist" "$APP_BUNDLE/Contents/Info.plist"
 cp "$ROOT/Resources/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
+# Bundle the on-device CLIP model + tokenizer when present (see Resources/CLIP-MODEL.md).
+for res in MobileCLIPImage.mlmodelc MobileCLIPText.mlmodelc bpe_simple_vocab_16e6.txt MobileCLIP-LICENSE.txt CLIP-TOKENIZER-LICENSE.txt; do
+  if [[ -e "$ROOT/Resources/$res" ]]; then
+    cp -R "$ROOT/Resources/$res" "$APP_BUNDLE/Contents/Resources/"
+    echo "==> Bundled CLIP resource: $res"
+  fi
+done
 cp -R "$ROOT/Vendor/Sparkle.framework" "$APP_BUNDLE/Contents/Frameworks/"
 printf 'APPL????' > "$APP_BUNDLE/Contents/PkgInfo"
 
@@ -155,7 +193,7 @@ codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" \
 codesign --force --options runtime --timestamp \
   --entitlements "$ROOT/Resources/Beacon.entitlements" \
   --sign "$SIGN_IDENTITY" "$APP_BUNDLE"
-codesign --verify --strict --verbose=2 "$APP_BUNDLE"
+codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
 
 mkdir -p "$DIST_DIR"
 
@@ -165,6 +203,8 @@ ditto -c -k --keepParent "$APP_BUNDLE" "$ZIP_PATH"
 xcrun notarytool submit "$ZIP_PATH" --keychain-profile "$NOTARY_PROFILE" --wait
 echo "==> Stapling notarization ticket to the app..."
 xcrun stapler staple "$APP_BUNDLE"
+xcrun stapler validate "$APP_BUNDLE"
+spctl --assess --type execute --verbose=2 "$APP_BUNDLE"
 
 # --- Build DMG --------------------------------------------------------------
 echo "==> Creating $DMG_PATH..."
@@ -176,14 +216,15 @@ hdiutil create -volname "$APP_NAME" -srcfolder "$STAGING" \
   -ov -format UDZO "$DMG_PATH" >/dev/null
 rm -rf "$STAGING"
 
+codesign --force --timestamp --sign "$SIGN_IDENTITY" "$DMG_PATH"
+
 # --- Notarize + staple the DMG ---------------------------------------------
 echo "==> Notarizing the DMG..."
 xcrun notarytool submit "$DMG_PATH" --keychain-profile "$NOTARY_PROFILE" --wait
 xcrun stapler staple "$DMG_PATH"
 
 # --- Verify Gatekeeper acceptance ------------------------------------------
-# Note: a .dmg is not itself code-signed; its notarization ticket is stapled,
-# so we validate the ticket here. (Gatekeeper assesses the app inside on open.)
+# Verify both the signed app and the disk image ticket before distribution.
 echo "==> Verifying notarization ticket on the DMG..."
 xcrun stapler validate "$DMG_PATH"
 rm -f "$ZIP_PATH"
@@ -201,10 +242,6 @@ cp "$DMG_PATH" "$APPCAST_STAGING/"
   -o "$ROOT/docs/appcast.xml" \
   "$APPCAST_STAGING"
 rm -rf "$APPCAST_STAGING"
-# The appcast (and site) go live on beaconmac.com via Cloudflare Pages.
-echo "==> Deploying docs/ (site + appcast) to beaconmac.com..."
-CLOUDFLARE_ACCOUNT_ID=305ab75281717568c5612a2abcbc696e \
-  npx wrangler pages deploy "$ROOT/docs" --project-name beaconmac --commit-dirty=true
 
 echo
 echo "==> Done. Notarized, stapled disk image:"
@@ -227,6 +264,12 @@ and fixes Finder's blind spots.
 Signed with a Developer ID and notarized by Apple — no security warnings.
 
 ## What's new in $VERSION
+- **Local image search.** Opt in to an on-device MobileCLIP index to find older
+  images by their content, with the models included in the download.
+- **Detailed search activity.** See the sources, filters, file searches, document
+  excerpts, image checks, timing, and errors for each AI search; copy the log or stop a run.
+- **More precise retrieval.** Better exact-filename ranking, sender/date filtering,
+  relevant document excerpts, and stricter image verification.
 - **Free for now — no paywall.** Download Beacon and start searching
   immediately. No account, no license key, no trial gate.
 - **AI mode.** Describe what you're looking for in plain language and
@@ -248,12 +291,8 @@ Messages, Notes, Mail, and Safari history need macOS **Full Disk Access**:
 open a protected filter in Beacon, click **Open Settings**, flip the
 toggle, then Quit & Reopen. File search needs no permissions at all.
 EOF
-  if gh release view "v$VERSION" >/dev/null 2>&1; then
-    gh release upload "v$VERSION" "$DMG_PATH" --clobber
-  else
-    gh release create "v$VERSION" "$DMG_PATH" \
-      --title "Beacon $VERSION" --notes-file "$NOTES_FILE"
-  fi
+  gh release create "v$VERSION" "$DMG_PATH" \
+    --target "$(git rev-parse HEAD)" --title "Beacon $VERSION" --notes-file "$NOTES_FILE"
   rm -f "$NOTES_FILE"
 
   # Push the refreshed appcast so existing installs see the update.
@@ -263,5 +302,8 @@ EOF
     git commit -m "Publish appcast for $VERSION"
     git push origin main
   fi
+  # Publish the feed only after the referenced GitHub download is available.
+  CLOUDFLARE_ACCOUNT_ID=305ab75281717568c5612a2abcbc696e \
+    npx wrangler pages deploy "$ROOT/docs" --project-name beaconmac --branch main
   echo "==> Release published."
 fi

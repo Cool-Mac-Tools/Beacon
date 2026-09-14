@@ -14,7 +14,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Sparkle auto-updater. Checks the appcast (SUFeedURL in Info.plist) on
     /// its default schedule and on demand from the status menu.
     private lazy var updaterController = SPUStandardUpdaterController(
-        startingUpdater: true,
+        startingUpdater: !SelfInstaller.isPreview,
         updaterDelegate: nil,
         userDriverDelegate: nil
     )
@@ -31,25 +31,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         installEditMenu()
         setupStatusItem()
         setupPanel()
-        setupHotKey()
+        if !SelfInstaller.isPreview { setupHotKey() }
         showPanel()
         // Instantiating the lazy controller starts Sparkle's scheduled checks.
         _ = updaterController
         // Background license re-check (no-op unless a key is stored and the
         // last check is >3 days old; failures just consume the grace window).
-        LicenseStore.shared.revalidateIfNeeded()
+        if !SelfInstaller.isPreview { LicenseStore.shared.revalidateIfNeeded() }
         // The in-panel lock's "Enter License…" button routes here.
         NotificationCenter.default.addObserver(
             self, selector: #selector(promptForLicense),
             name: Notification.Name("BeaconEnterLicense"), object: nil)
-        enableLaunchAtLoginOnce()
+        if !SelfInstaller.isPreview { enableLaunchAtLoginOnce() }
         // Touch the Messages DB once so macOS registers Beacon in the Full Disk
         // Access list (users can then just flip the toggle, no manual add).
-        engine.warmMessageAccess()
+        if !SelfInstaller.isPreview { engine.warmMessageAccess() }
         // Begin recording clipboard history (text only, private/transient
         // copies excluded) so it's searchable under the Clipboard filter.
-        ClipboardStore.shared.start()
+        if !SelfInstaller.isPreview { ClipboardStore.shared.start() }
         AISettings.shared.loadEnabledSources()
+        // Build/refresh the on-device semantic image index in the background so
+        // AI visual search can rank the whole library. No-ops if the CLIP model
+        // isn't bundled (falls back to the recent-images sweep).
+        ImageSemanticIndex.shared.start()
         Log.write("Ready. Menu-bar icon active; panel shown.")
     }
 
@@ -58,7 +62,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Rebuilt on every open so the license line reflects current state.
     private var statusMenu: NSMenu {
         let menu = NSMenu()
-        menu.addItem(withTitle: "Open Beacon  (⌥S)",
+        menu.addItem(withTitle: SelfInstaller.isPreview ? "Open Beacon Preview" : "Open Beacon  (⌥S)",
                      action: #selector(showPanelFromMenu),
                      keyEquivalent: "")
         menu.addItem(.separator())
@@ -68,6 +72,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             keyEquivalent: ""
         )
         checkForUpdates.target = updaterController
+        checkForUpdates.isEnabled = !SelfInstaller.isPreview
         menu.addItem(checkForUpdates)
         switch LicenseStore.shared.status {
         case .licensed, .grace:
@@ -84,6 +89,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                     action: #selector(toggleLaunchAtLogin),
                                     keyEquivalent: "")
         launchItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        launchItem.isEnabled = !SelfInstaller.isPreview
         menu.addItem(launchItem)
         menu.addItem(withTitle: "AI Settings…",
                      action: #selector(showAISettings),
@@ -113,6 +119,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func toggleLaunchAtLogin() {
+        guard !SelfInstaller.isPreview else { return }
         do {
             if SMAppService.mainApp.status == .enabled {
                 try SMAppService.mainApp.unregister()
@@ -184,6 +191,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             button.image = BeaconMenuIcon.make()
             button.imagePosition = .imageOnly
             button.toolTip = "Beacon - click to search (⌥S)"
+            if SelfInstaller.isPreview {
+                button.title = "Preview"
+                button.imagePosition = .imageLeading
+                button.toolTip = "Beacon Preview — click to search"
+            }
             // Left-click opens the search bar; right-click shows the menu.
             button.target = self
             button.action = #selector(statusItemClicked)

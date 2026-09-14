@@ -50,7 +50,7 @@ Clipboard, browser history, and System Settings shortcuts.
 
 ## Download (for users)
 
-1. Go to the [latest release](https://github.com/claytonwendelwon/Mac-search/releases/latest).
+1. Go to the [latest release](https://github.com/Cool-Mac-Tools/Beacon/releases/latest).
 2. Download `Beacon-<version>.dmg` and open it.
 3. **Double-click Beacon** - it installs itself into Applications, relaunches
    from there, and opens the search bar with a first-run hotkey tip.
@@ -219,7 +219,7 @@ Hotkey / menu bar  ->  floating NSPanel  ->  SwiftUI SearchView
 - Optional cloud-provider integrations for files that are visible remotely but
   not downloaded locally.
 - Richer content snippets for text matches inside PDFs/documents.
-- Optional on-device photo recognition.
+- Expand semantic indexing to additional local folders and cloud providers.
 
 ## License
 
@@ -233,3 +233,53 @@ development? [Buy a license at beaconmac.com](https://beaconmac.com) ($15/year).
 
 By submitting a contribution (pull request, patch, or suggestion) you agree it
 may be incorporated into Beacon under the same license.
+
+## Semantic search development
+
+AI search now combines file search, bounded document excerpts, and an optional
+local image index. In AI → Manage, enable image indexing and connect Photos if
+wanted. It ranks older images by their content before asking your provider to
+verify at most 40 candidates. Date constraints apply before ranking. Source text
+is treated as untrusted data, and cancelling a query cancels active HTTP requests.
+
+`python3 scripts/prepare-models.py` downloads and verifies Apple's MobileCLIP-S0
+encoders (about 108 MB) and compiles them using the installed Swift/Core ML tools.
+Run/release packaging prepares and bundles them automatically. See
+[the model notes](Resources/CLIP-MODEL.md) for coverage, cache location, and limits.
+
+Validation:
+
+- `bash scripts/test.sh`: XCTest with full Xcode, or portable checks with CLT.
+- `bash scripts/test-semantic.sh`: date ranking, excerpts, and media classification.
+- `bash scripts/test-semantic.sh --models`: real tokenizer and both image/text encoders,
+  including a generated red/blue image retrieval check. No personal data or paid API calls.
+- `bash scripts/test-semantic.sh --text-models`: text-only model checks when the
+  execution environment blocks IOSurface/image inference.
+
+GitHub Actions builds the app, runs XCTest, and exercises the actual pinned models
+on macOS 26. Local tool sandboxes can block process/graphics services needed by Core ML;
+that is reported as a test failure, never silently marked successful.
+
+### Inspect an AI search
+
+AI searches now show **Search activity** while they run. Expand it after a query
+finishes to inspect requested tools, effective keyword/sender/date/type filters,
+executed Spotlight predicates, candidate filenames and counts, document excerpts,
+image-batch coverage, timings, and provider retry/error diagnostics. **Copy log**
+exports this query's trace; it stays in memory until the next query by default.
+API headers/keys and the model's private reasoning are not part of the trace.
+**Stop** invalidates the run and cancels pending provider requests.
+
+File retrieval gathers filename and content candidates separately, with metadata
+sorting before limits. Strong older filename matches can outrank recent incidental
+hits. Mail applies sender/date constraints in SQL before its candidate limit, and
+document previews prefer passages containing more of the requested terms. Empty
+searches prompt alternate keywords while preserving the user's hard constraints.
+Image verification reports inspected/skipped counts instead of implying exhaustive
+coverage. These changes are covered by synthetic ranking, mail-database, excerpt,
+and trace-lifecycle regressions in `bash scripts/test-semantic.sh`.
+
+`bash scripts/preview.sh` builds `dist/Beacon-Preview.app`, with a separate app ID.
+It runs in place, with automatic installation, updates, login registration, global
+hotkey capture, and clipboard recording disabled. Open its panel from its menu-bar
+icon. It uses separate preferences; configure AI and sources in its Manage page.
