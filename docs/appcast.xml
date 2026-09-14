@@ -2,7 +2,7 @@
 <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
     <channel>
         <title>Beacon</title>
-        <link>https://claytonwendelwon.github.io/Mac-search/appcast.xml</link>
+        <link>https://beaconmac.com/appcast.xml</link>
         <description>Updates for Beacon, the fast native macOS search launcher.</description>
         <language>en</language>
         <!-- Items are appended by scripts/release.sh via generate_appcast.
