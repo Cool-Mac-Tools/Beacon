@@ -131,10 +131,19 @@ final class SearchStateTests: XCTestCase {
 }
 
 final class SearchRefinementTests: XCTestCase {
-    func testEveryTopLevelFilterHasThreeDimensions() {
+    func testEachFilterOffersRelevantDistinctRefinements() {
         for type in FileType.allCases {
-            XCTAssertEqual(RefinementCatalog.dimensions(for: type).count, 3,
-                           "\(type) should expose its top three dimensions")
+            let dimensions = RefinementCatalog.dimensions(for: type)
+            XCTAssertFalse(dimensions.isEmpty, "\(type) should offer refinements")
+            XCTAssertEqual(Set(dimensions.map(\.id)).count, dimensions.count)
+            for dimension in dimensions {
+                XCTAssertFalse(dimension.options.isEmpty)
+                XCTAssertEqual(Set(dimension.options.map(\.id)).count, dimension.options.count)
+            }
+        }
+        XCTAssertEqual(RefinementCatalog.dimensions(for: .messages).map(\.id), ["content"])
+        for type in [FileType.pdfs, .developer] {
+            XCTAssertEqual(RefinementCatalog.dimensions(for: type).map(\.id), ["location", "time"])
         }
     }
 
@@ -221,13 +230,22 @@ final class SearchRefinementTests: XCTestCase {
                        selection)
     }
 
-    func testPhotosLibraryIsNotOfferedAsARefinement() {
+    func testPhotosLibraryRefinementMatchesLibraryMediaOnly() {
         let photoSource = RefinementCatalog.dimensions(for: .photos)
             .first { $0.id == "photo-source" }
         let videoLocation = RefinementCatalog.dimensions(for: .videos)
             .first { $0.id == "location" }
-        XCTAssertNil(photoSource?.options.first { $0.id == "photos-library" })
-        XCTAssertNil(videoLocation?.options.first { $0.id == "photos-library" })
+        XCTAssertEqual(photoSource?.options.first { $0.id == "photos-library" }?.isEnabled, true)
+        XCTAssertEqual(videoLocation?.options.first { $0.id == "photos-library" }?.isEnabled, true)
+        var facets = RefinementFacets.empty
+        facets.sourceApp = "photos-library"
+        for (type, dimension) in [(FileType.photos, "photo-source"), (.videos, "location")] {
+            let selection = RefinementSelection(choices: [dimension: "photos-library"])
+            XCTAssertTrue(RefinementMatcher.matches(fileResult(path: "/tmp/library-media", facets: facets),
+                                                   type: type, selection: selection))
+            XCTAssertFalse(RefinementMatcher.matches(fileResult(path: "/tmp/local-media"),
+                                                    type: type, selection: selection))
+        }
     }
 
     func testPSDCanBeAddedAndMatchedAsAnImageFormat() {

@@ -119,7 +119,11 @@ fi
 
 # --- Build ------------------------------------------------------------------
 echo "==> Building $APP_NAME $VERSION (release)..."
-if ! swift build -c release; then
+# Some managed hosts already sandbox this process and cannot nest SwiftPM's
+# manifest sandbox. Normal developer builds retain SwiftPM's default sandbox.
+SPM_FLAGS=(--cache-path "$PWD/.build/spm-cache")
+if [[ "${SWIFTPM_DISABLE_SANDBOX:-0}" == "1" ]]; then SPM_FLAGS+=(--disable-sandbox); fi
+if ! swift build -c release "${SPM_FLAGS[@]}"; then
   echo "==> SwiftPM unavailable; compiling directly with swiftc..."
   mkdir -p "$BUILD_DIR"
   SOURCE_FILES=()
